@@ -15,6 +15,7 @@ uv sync --all-groups
 - [`rgb_pose_to_lerobot.py`](rgb_pose_to_lerobot.py): 给第一视角web video封装了一份代码，详见[`rgb_pose_example/README.md`](examples/rgb_pose_example/README.md)。
 - [`lerobot_creator_example.py`](lerobot_creator_example.py): 教程示例代码。
 - [`unreal.py`](unreal.py): 将 `3d-simu-ue` 录制出的 raw episode 转为按 scene 组织的 LeRobot v2.1 数据集；使用说明见脚本顶部注释。
+- [`human_replay.py`](human_replay.py): 将完成 v2 英文标注的人工回放转为四视角 LeRobot v2.1 VLN 数据；[输入合同、命令及失败处理](docs/human-replay/README.md)。
 
 ## Map2Nav VLN-CE replay
 
