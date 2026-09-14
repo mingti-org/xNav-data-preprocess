@@ -105,11 +105,18 @@ def write_synthetic_archives(root: Path) -> tuple[Path, Path]:
     return jsonl_archive, frames_dir
 
 
-def write_stage4_processed(root: Path) -> Path:
+def write_stage4_processed(
+    root: Path,
+    *,
+    source_episode: str = "seed_9301/synthetic_scene/episode_000",
+    instruction: str = "Follow the synthetic path",
+    commands: list[list[float]] | None = None,
+) -> Path:
     processed = root / "stage4"
     raw_root = root / "raw"
-    raw_root.mkdir(parents=True)
-    source_episode = "seed_9301/synthetic_scene/episode_000"
+    raw_root.mkdir(parents=True, exist_ok=True)
+    if commands is None:
+        commands = [[0.1, -0.05, 0.02]] * 3
     camera_relative = f"metadata/{source_episode}/camera.json"
     jsonl_relative = f"jsonl/{source_episode}.jsonl"
     source_manifest_relative = f"metadata/{source_episode}/source_manifest.json"
@@ -147,7 +154,7 @@ def write_stage4_processed(root: Path) -> Path:
     camera_path.write_text(json.dumps(camera), encoding="utf-8")
 
     rows = []
-    for frame_index in range(3):
+    for frame_index, command in enumerate(commands):
         current_views = {}
         for view, value in view_colors.items():
             relative = f"frames/{source_episode}/{view}/frame_{frame_index + 1:05d}.jpg"
@@ -159,16 +166,16 @@ def write_stage4_processed(root: Path) -> Path:
             current_views[view] = relative
         rows.append(
             {
-                **make_row(current_views["front"], "Follow the synthetic path", [0.1, -0.05, 0.02]),
+                **make_row(current_views["front"], instruction, command),
                 "camera_metadata": camera_relative,
                 "current_views": current_views,
-                "episode_id": "episode_000",
+                "episode_id": source_episode.rsplit("/", 1)[-1],
                 "frame_index": frame_index,
                 "sim_time_s": frame_index / 10.0,
             }
         )
     jsonl_path = processed / jsonl_relative
-    jsonl_path.parent.mkdir(parents=True)
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.write_text(
         "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
         encoding="utf-8",
@@ -188,17 +195,18 @@ def write_stage4_processed(root: Path) -> Path:
         ),
         encoding="utf-8",
     )
-    (processed / "manifest.json").write_text(
+    manifest_path = processed / "manifest.json"
+    entries = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))["successful_episodes"]
+        if manifest_path.exists() else []
+    )
+    entries.append({"source_episode": source_episode, "manifest": source_manifest_relative})
+    manifest_path.write_text(
         json.dumps(
             {
                 "schema_version": "omtrackvla.processed_tracking.v1",
                 "input_root": str(raw_root.resolve()),
-                "successful_episodes": [
-                    {
-                        "source_episode": source_episode,
-                        "manifest": source_manifest_relative,
-                    }
-                ],
+                "successful_episodes": entries,
             }
         ),
         encoding="utf-8",
