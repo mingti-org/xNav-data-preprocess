@@ -16,7 +16,7 @@ uv sync --all-groups
 - [`lerobot_creator_example.py`](lerobot_creator_example.py): 教程示例代码。
 - [`unreal.py`](unreal.py): 将 `3d-simu-ue` 录制出的 raw episode 转为按 scene 组织的 LeRobot v2.1 数据集；使用说明见脚本顶部注释。
 - [`human_replay.py`](human_replay.py): 将完成 v2 英文标注的人工回放转为四视角 LeRobot v2.1 VLN 数据；[输入合同、命令及失败处理](docs/human-replay/README.md)。
-- [`tracking.py`](tracking.py): 将 EVT-Collect 四视角导出转为 LeRobot v2.1；[并行转换、校验职责及验证记录](docs/tracking-conversion.md)。
+- [`tracking.py`](tracking.py): 将 EVT-Collect raw/四视角导出按实测位姿转为 LeRobot v2.1；[位姿来源、直接输出目录与并行转换](docs/tracking-conversion.md)。
 
 ## Map2Nav VLN-CE replay
 

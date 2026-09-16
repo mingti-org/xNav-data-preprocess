@@ -15,17 +15,17 @@ import numpy as np
 import pyarrow.parquet as pq
 from PIL import Image
 
+from tracking_pose import measured_local_poses
+
 from tracking import (
     ACTION_KEY,
-    CONTROLLER_DT,
     EXPECTED_FULL_COUNTS,
     FPS,
     STATE_KEY,
     EpisodePlan,
     assign_root_indices,
     convert_dataset,
-    convert_stage4_dataset,
-    integrate_nominal_poses,
+    convert_four_view_dataset,
     split_inventory,
     validate_output_dataset,
 )
@@ -48,6 +48,7 @@ def make_row(
         "actions": [command],
         "collision": collision,
         "target_distance": 1.0,
+        "teacher": {"robot_position": [0, 0, 0], "target_position": [1, 0, 0], "yaw_error_rad": 0.0},
     }
 
 
@@ -174,6 +175,14 @@ def write_stage4_processed(
                 "sim_time_s": frame_index / 10.0,
             }
         )
+    raw_episode = raw_root / source_episode
+    raw_episode.mkdir(parents=True, exist_ok=True)
+    raw_rows = [
+        {"step_index": i, "video_frame_index": i, "sim_time_s": i / 10,
+         "base_velocity_normalized": command, "teacher": rows[i]["teacher"]}
+        for i, command in enumerate(commands)
+    ]
+    (raw_episode / "steps.jsonl").write_text("".join(json.dumps(row) + "\n" for row in raw_rows))
     jsonl_path = processed / jsonl_relative
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.write_text(
@@ -233,36 +242,10 @@ class TrackingConversionTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def test_integrate_nominal_poses_is_pre_action_and_clipped(self):
-        rows = [
-            make_row("unused", "task", [1.0, 0.0, 0.0]),
-            make_row("unused", "task", [0.0, 1.0, 0.0]),
-            make_row("unused", "task", [0.0, 0.0, 1.0]),
-            make_row("unused", "task", [100.0, 100.0, 100.0]),
-        ]
-        poses = integrate_nominal_poses(rows)
-        self.assertEqual(poses.shape, (4, 7))
-        np.testing.assert_allclose(poses[0], [0, 0, 0, 0, 0, 0, 1], atol=1e-7)
-        np.testing.assert_allclose(poses[1, :3], [15 * CONTROLLER_DT, 0, 0], atol=1e-7)
-        np.testing.assert_allclose(
-            poses[2, :3],
-            [15 * CONTROLLER_DT, 10 * CONTROLLER_DT, 0],
-            atol=1e-7,
-        )
-        self.assertGreater(poses[3, 5], 0.0)
-        self.assertEqual(len(poses), len(rows))
-        # The last extreme command is deliberately not integrated: there is no frame N+1.
-        np.testing.assert_allclose(poses[-1], poses[3], atol=0.0)
-
-    def test_integrate_negative_lateral_and_yaw(self):
-        rows = [
-            make_row("unused", "task", [0.0, -1.0, 0.0]),
-            make_row("unused", "task", [0.0, 0.0, -1.0]),
-            make_row("unused", "task", [0.0, 0.0, 0.0]),
-        ]
-        poses = integrate_nominal_poses(rows)
-        self.assertLess(poses[1, 1], 0.0)
-        self.assertLess(poses[2, 5], 0.0)
+    def test_commands_do_not_move_measured_stationary_pose(self):
+        rows = [make_row("unused", "task", [1, 0, 1]) for _ in range(3)]
+        poses, _ = measured_local_poses(rows)
+        np.testing.assert_array_equal(poses, [[0, 0, 0, 0, 0, 0, 1]] * 3)
 
     def test_split_and_root_indices_are_deterministic(self):
         plans = [
@@ -344,7 +327,7 @@ class TrackingConversionTests(unittest.TestCase):
     def test_stage4_four_view_end_to_end(self):
         processed = write_stage4_processed(self.root)
         output = self.root / "enactive"
-        result = convert_stage4_dataset(
+        result = convert_four_view_dataset(
             processed_root=processed,
             output_dir=output,
             work_dir=self.root / "work",
@@ -358,7 +341,7 @@ class TrackingConversionTests(unittest.TestCase):
         summary = validate_output_dataset(output, decode_videos=True)
         self.assertEqual(summary, {"train": {"episodes": 1, "tasks": 1, "frames": 3}})
 
-        train = output / "train"
+        train = output
         info = json.loads((train / "meta" / "info.json").read_text(encoding="utf-8"))
         video_features = [
             key for key, value in info["features"].items() if value.get("dtype") == "video"
@@ -374,7 +357,7 @@ class TrackingConversionTests(unittest.TestCase):
         self.assertEqual(extras["source_raw_root"], str((self.root / "raw").resolve()))
         self.assertEqual(extras["source_raw_episode"], "seed_9301/synthetic_scene/episode_000")
         self.assertEqual(
-            extras["source_intermediate_jsonl"],
+            extras["source_jsonl"],
             "jsonl/seed_9301/synthetic_scene/episode_000.jsonl",
         )
         self.assertEqual(extras["camera_keys"], ["front", "left", "right", "rear"])

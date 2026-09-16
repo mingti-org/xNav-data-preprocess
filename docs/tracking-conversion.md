@@ -1,62 +1,62 @@
-# Tracking 四视角并行转换
+# Tracking 实测位姿转换
 
-`tracking.py --processed-root` 接收 EVT-Collect 的四视角 Stage-4 导出，输出一个 `train/` LeRobot v2.1 数据根。使用原有 `--workers` 参数同时控制 episode 输入校验与视频转换的并发数。
+`tracking.py` 将 EVT-Collect tracking 数据转为 LeRobot v2.1。每一行仍对应动作前的 RGB 观测；`observation.state` 和 `action` 都存储**这一帧的实测位姿**，不再通过控制命令推算位置。
 
-## 执行流程
+## 位姿和控制命令
 
-1. 主线程读取全局 manifest、每条 episode 的 source manifest、相机元数据和 JSONL 首条非空行。根据声明的帧数和首行指令，按既有规则确定 episode、task、全局 frame 编号。此阶段不枚举或打开图片，也不解析完整 JSONL。
-2. 每个 worker 读取本 episode 的完整 JSONL，核对实际帧数、指令、动作有效性、episode 身份、帧序号、时间戳和四视角路径。相同相机引用在该 worker 内只解析一次。图像路径仍检查符号链接解析后的根目录边界、episode/view 身份、普通文件类型和重复引用。
-3. worker 按原顺序读取每张图片，在用于编码的同一次 `Image.open()` 中检查尺寸并解码 RGB，同时计算统计量。保留 x264 参数、10 FPS、四视角映射和原生视频完整解码校验。
-4. 每条 episode 的 Parquet 和四路视频全部通过检查后，才计入完成进度。汇总按预先固定的编号生成元数据，不依赖 worker 完成顺序；原生数据集校验成功后原子发布最终目录。
+- **STT**：位置来自 `teacher.robot_position`；朝向由同帧 `target_position` 和 `yaw_error_rad` 恢复。采集端的误差在 Habitat XZ 平面计算，因此输出朝向为 `atan2(-target_delta_z, target_delta_x) + yaw_error_rad`。
+- **DT/AT**：直接读取 `teacher.dt_scene.robot_pose.position_m/yaw_rad`。不使用预测端点、上一转移或终端位姿冒充当前帧位姿。
+- 所有位姿转换到第一帧机体坐标：X 向前、Y 向左、Z 向上；旋转存为 `qx,qy,qz,qw`，第一帧为单位位姿。真实高度变化保留。
+- 原始命令保存在独立的 `tracking.command_normalized` 列（forward/left/yaw），不覆盖同名 `action` 的位姿合同。
+- 缺实测字段、非有限位姿或 STT 目标与机器人重合而无法恢复朝向时，报告 episode/行号并终止转换；没有名义积分回退。
 
-异常输入仍使整次转换失败。错误发生时取消尚未执行的任务，等待正在执行的 worker 退出；中间产物保留在原生 staging 中。即使使用原有 `--overwrite`，转换失败也不会替换已有输出。
+受阻时，非零前进命令可以对应零位移；滑动时，位姿保留实际侧向位移。等待帧和最后一个已有观测都保留，不额外生成没有 RGB 的终端帧。H16 空间重采样由 Enactive 训练端完成，本转换器不做重采样、减速或末尾样本筛选；VLN 转换不变。
 
-## 为什么会更快
+## 输入与输出
 
-旧实现先在主线程检查所有 JSONL 行及所有图片，再启动编码池；编码时又打开相同图片。现在逐帧校验随 episode 并行执行，尺寸校验复用编码读取，从每张图片两次打开减少为一次。
-
-以 371100 个时间帧、四视角输入为例，取消了 1484400 次额外图片打开。同一 episode 的相机路径不再逐帧重复解析。主线程也不再保留全库 JSONL 行和图像路径，只保留轻量计划与相机元数据；完整逐帧数据由当前运行的 worker 持有。
-
-主线程整理元数据仍是串行步骤，图像路径检查及编码仍有 Python、CPU 和共享存储开销，因此 worker 数增加不保证线性提速。没有新增“跳过校验”开关，也没有扩大成功数据选择范围。
-
-## 进度日志
-
-- `Indexed metadata for N/M episodes`：完成轻量清单整理，尚未表示已生成视频。
-- `Converted N/M episodes, F/T frames, ... frames/s, conversion ETA ...`：已完成 episode 的校验、编码和视频验证。ETA 按本轮累计帧吞吐估算，早期和尾部可能波动。
-- `Validating final dataset metadata`：视频阶段完成，进入最终元数据检查。前一条 ETA 不包含本阶段；最终退出与正式目录发布才代表完成。
-
-## 使用方式
+优先直接读取 raw，避免 MP4 → JPEG → MP4 的中间过程：
 
 ```bash
-.venv/bin/python tracking.py \
-  --processed-root /absolute/path/to/stage4 \
-  --output-dir /absolute/path/to/lerobot \
-  --work-dir /absolute/path/on/same/filesystem/work \
-  --workers 64
+python tracking.py \
+  --raw-root /path/to/tracking/raw/stt \
+  --output-dir /path/to/new/stt \
+  --work-dir /path/on/same/filesystem/work \
+  --workers 32
 ```
 
-输出与 work 需要位于同一文件系统，以支持现有的原子目录重命名。EVT-Collect 现有 `scripts/convert_tracking.py` 已传入上述参数，合并后可直接使用，不需要修改采集项目入口。
+raw 目录需为 `<seed>/<scene>/<episode>/{status.json,camera.json,steps.jsonl,videos/}`。沿用 EVT-Collect 导出条件，只转换 `state=complete` 且 `success=true` 的 episode，日志报告跳过数量。四路视频直接复制，解码一次计算像素统计并核对帧数、时间戳、分辨率及编码合同，不重新编码。
 
-## 本轮实现与验证
+已有 Stage-4 导出仍可通过 `--processed-root` 输入。其 manifest 的 `input_root` 必须指向对应原始数据；worker 按 episode 读取 raw steps，核对每行索引、时间和命令，再将实测位姿与 JPEG 序列配对。Stage-4 的图片校验和编码沿用原流程。旧 tar 输入只有在行内也具有实测 teacher 字段时才能转换，不再支持仅靠命令生成位姿。
 
-2026-09-14 用户批准将轻量计划整理与并行输入校验分开、合并图片检查与编码、保留必要校验，并要求基于 xNav `glx` 创建独立分支供后续 AT 转换使用。
+单个训练数据根直接位于 `--output-dir`，**不再增加 `train/`**：
 
-- 基线：`glx@a65de81a64af4129cfd404174a4c42be362adc46`。
-- 分支：`perf/tracking-parallel-validation`。
-- 修改范围：四视角入口的 `Stage4EpisodeSource`、`scan_stage4_inventory()`、`_load_stage4_episode()`、`_process_stage4_episode()`、`encode_video_from_paths()`、`convert_stage4_dataset()`，以及对应测试和说明。
-- 数据合同：episode/task/frame 编号、完整帧数、四路视频、相机元数据、累计 nominal pose、等待帧和动作语义保持一致。训练端 H16 重采样不属于该转换器。
-- 当前 DT 使用的主工作区未修改；合并及后续正式 AT 转换由用户安排。
+```text
+stt/
+  data/chunk-000/episode_000000.parquet
+  videos/chunk-000/video.front/episode_000000.mp4
+  videos/chunk-000/video.left/...
+  videos/chunk-000/video.right/...
+  videos/chunk-000/video.rear/...
+  meta/info.json
+  meta/episodes*.jsonl
+```
 
-验证结果：
+原始 `back` 映射到 `video.rear`。相机元数据继续写入 extras；位姿来源标记为 `measured_first_frame_local_body_pose_v1`、`pose_is_executed=true`，同时记录具体来源字段。位姿、命令及图像统计均按本次实际输出重新生成；Enactive 的 H16 变换后统计仍需在新实验中单独计算。
 
-- `test/test_tracking.py` 与 `test/test_tracking_stage4_parallel.py` 共 29 项通过。覆盖真实四视角视频转换、两个 worker 同时执行输入校验、每张输入图片只打开一次、相机路径按 episode 缓存、强制逆序完成时所有输出字节一致，以及 18 类损坏/不一致输入阻止发布。
-- 异常覆盖缺帧、坏 JPEG、错误尺寸、帧号/时间/episode 身份错位、后续指令变化、非法动作、帧数不符、视角混淆、重复图片、相机引用冲突、绝对/越界路径和符号链接越界。额外确认失败时已有输出保持原样。
-- 用相同的两条合成 episode 对照基线原版与本分支：2 episode、2 task、6 frame，16 个输出文件逐字节一致，包含 Parquet、8 个视频和全部元数据；其中零动作产生的重复位姿保留。
-- 尚未测量真实全量 AT 的转换吞吐，不将合成测试作为生产加速倍数证明。
+## 并行与发布
 
-复现针对性测试（将 `TMPDIR` 指向任务独占目录）：
+`--workers` 控制 episode 并发；raw 每个 worker 同时解码一路视频，解码器单线程，四个视角依次处理。Stage-4 编码器同样单线程。编号与元数据顺序不依赖 worker 完成顺序。后续根据 Slurm 分配的 CPU、内存和共享存储吞吐确定 worker 数，不预设增加 worker 一定线性提速。
+
+转换先写入 work 下的 staging，完成必要校验后重命名为正式输出，因此 work 与 output 必须在同一文件系统。错误时保留 staging，正式数据不发布；默认拒绝覆盖已有目录。新版本应写入新目录，保留原数据。
+
+进度中的 `Converted N/M episodes` 包含已完成的位姿转换、视频处理与检查；`Validating final dataset metadata` 后成功退出并发布目录才代表完成。
+
+## 针对性验证
 
 ```bash
-OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
-  .venv/bin/python -m pytest -q test/test_tracking.py test/test_tracking_stage4_parallel.py
+TMPDIR=/path/to/task/tmp OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  python -m pytest -q test/test_tracking.py \
+    test/test_tracking_stage4_parallel.py test/test_tracking_measured.py
 ```
+
+覆盖 STT/DT/AT 坐标方向、跨 ±180°、受阻/滑动、缺位姿失败、命令留存、四视角 raw 和 Stage-4 转换、直接目录布局、并发确定性和坏输入阻止发布。真实数据只做小样本试转；不以这些检查证明训练收益或全量转换吞吐。

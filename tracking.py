@@ -1,13 +1,13 @@
-from __future__ import annotations
-
 """Convert OmTrackVLA tracking rollouts to LeRobot v2.1.
 
-The legacy seed-101 tar input and the processed four-view v1 input are both
-supported.  Each source JSONL remains one complete episode.  Video frame ``t``
+Raw four-view MP4, Stage-4 JPEG and tar inputs with measured pose metadata
+are supported.  Each source JSONL remains one complete episode.  Video frame ``t``
 is the pre-action observation in row ``t``. ``observation.state[t] == action[t]``
-is the first-frame-local cumulative nominal body pose, and row ``t``'s first
-command advances pose ``t + 1``.
+is the measured first-frame-local body pose. Raw commands are saved separately;
+they do not determine the pose labels.
 """
+
+from __future__ import annotations
 
 import argparse
 import hashlib
@@ -31,15 +31,17 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PIL import Image
 
+from tracking_pose import measured_local_poses
+
 TASK_DESCRIPTION_KEY = "annotation.human.action.task_description"
 STATE_KEY = "observation.state"
 ACTION_KEY = "action"
+CONTROL_KEY = "tracking.command_normalized"
 POSE_AXES = ["tx", "ty", "tz", "qx", "qy", "qz", "qw"]
 
 SEED = "seed_101"
 FPS = 10
 CONTROLLER_DT = 1.0 / 40.0
-VELOCITY_SCALE = np.array([15.0, 10.0, 6.28], dtype=np.float64)
 IMAGE_HEIGHT = 384
 IMAGE_WIDTH = 384
 CHUNK_SIZE = 1000
@@ -71,6 +73,7 @@ PARQUET_COLUMNS = (
     TASK_DESCRIPTION_KEY,
     STATE_KEY,
     ACTION_KEY,
+    CONTROL_KEY,
     "frame_index",
     "timestamp",
     "index",
@@ -110,7 +113,7 @@ class EpisodeResult:
 
 
 @dataclass(frozen=True)
-class Stage4EpisodeSource:
+class FourViewEpisodeSource:
     """Lightweight metadata; each worker owns row and image validation."""
 
     plan: EpisodePlan
@@ -118,6 +121,7 @@ class Stage4EpisodeSource:
     jsonl_path: Path
     camera_path: Path
     camera_metadata: dict[str, Any]
+    raw_video_input: bool = False
 
 
 def configure_temp_environment(work_dir: str | Path) -> Path:
@@ -328,39 +332,9 @@ def validate_full_split(plans: Sequence[EpisodePlan]) -> None:
         raise ValueError("val_unseen instructions leak into train or val_seen")
 
 
-def integrate_nominal_poses(rows: Sequence[dict[str, Any]]) -> np.ndarray:
-    """Build N pre-action poses from N rows; the final command is not integrated."""
-    if not rows:
-        raise ValueError("cannot integrate an empty episode")
-    poses = np.empty((len(rows), 7), dtype=np.float32)
-    poses[0] = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-    x = 0.0
-    y = 0.0
-    yaw = 0.0
-    for row_index in range(len(rows) - 1):
-        _validate_row_schema(rows[row_index], "<episode>", row_index)
-        raw = np.asarray(rows[row_index]["actions"][0], dtype=np.float64)
-        forward, left, yaw_rate = np.clip(raw, -1.0, 1.0) * VELOCITY_SCALE
-        dx = (forward * math.cos(yaw) - left * math.sin(yaw)) * CONTROLLER_DT
-        dy = (forward * math.sin(yaw) + left * math.cos(yaw)) * CONTROLLER_DT
-        x += dx
-        y += dy
-        yaw += yaw_rate * CONTROLLER_DT
-        poses[row_index + 1] = np.array(
-            [x, y, 0.0, 0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)],
-            dtype=np.float32,
-        )
-    if not np.isfinite(poses).all():
-        raise ValueError("nominal pose contains non-finite values")
-    quaternion_norm = np.linalg.norm(poses[:, 3:7], axis=1)
-    if not np.allclose(quaternion_norm, 1.0, atol=1e-5):
-        raise ValueError("nominal pose contains a non-unit quaternion")
-    return poses
-
-
 def _root_for_split(output_dir: Path, split: str) -> Path:
     if split == "train":
-        return output_dir / "train"
+        return output_dir
     if split in {"val_seen", "val_unseen"}:
         return output_dir / "test" / split
     raise ValueError(f"unknown split: {split!r}")
@@ -424,16 +398,21 @@ def _fixed_list_array(values: np.ndarray, width: int, value_type: pa.DataType) -
     return pa.FixedSizeListArray.from_arrays(flat, width)
 
 
-def write_episode_parquet(path: Path, plan: EpisodePlan, poses: np.ndarray) -> None:
+def write_episode_parquet(
+    path: Path, plan: EpisodePlan, poses: np.ndarray, commands: np.ndarray,
+) -> None:
     count = plan.length
     if poses.shape != (count, 7):
         raise ValueError(f"pose shape mismatch for {plan.source_key}: {poses.shape}")
+    if commands.shape != (count, 3) or not np.isfinite(commands).all():
+        raise ValueError(f"invalid commands for {plan.source_key}")
     annotation_values = np.full((count, 1), plan.task_index, dtype=np.int32)
     frame_indices = np.arange(count, dtype=np.int64)
     arrays = [
         _fixed_list_array(annotation_values, 1, pa.int32()),
         _fixed_list_array(poses.astype(np.float32, copy=False), 7, pa.float32()),
         _fixed_list_array(poses.astype(np.float32, copy=True), 7, pa.float32()),
+        _fixed_list_array(commands.astype(np.float32), 3, pa.float32()),
         pa.array(frame_indices, type=pa.int64()),
         pa.array(frame_indices.astype(np.float32) / np.float32(FPS), type=pa.float32()),
         pa.array(frame_indices + np.int64(plan.global_frame_start), type=pa.int64()),
@@ -654,7 +633,8 @@ def _process_episode(
             raise FileNotFoundError(f"missing current frame for {plan.source_key}: {name}")
         image_members.append(member)
 
-    poses = integrate_nominal_poses(rows)
+    poses, pose_source = measured_local_poses(rows)
+    commands = np.asarray([row["actions"][0] for row in rows], dtype=np.float32)
     root = _root_for_split(output_dir, plan.split)
     parquet_path, video_path = _episode_paths(root, plan.episode_index)
     parquet_partial = parquet_path.with_name(parquet_path.name + ".partial")
@@ -662,7 +642,7 @@ def _process_episode(
     for partial in (parquet_partial, video_partial):
         partial.unlink(missing_ok=True)
     try:
-        write_episode_parquet(parquet_partial, plan, poses)
+        write_episode_parquet(parquet_partial, plan, poses, commands)
         video_stats = encode_video_from_tar(
             video_partial,
             image_members,
@@ -684,6 +664,7 @@ def _process_episode(
         STATE_KEY: pose_stats,
         VIDEO_KEY: video_stats,
         ACTION_KEY: pose_stats,
+        CONTROL_KEY: _numeric_stats(commands),
     }
     prefix = f"{plan.source_id}/{plan.source_episode_id}"
     extras = {
@@ -701,10 +682,11 @@ def _process_episode(
         "capture_width": IMAGE_WIDTH,
         "capture_height": IMAGE_HEIGHT,
         "camera_keys": ["front"],
-        "pose_semantics": "controller_nominal_first_frame_local_body_pose",
+        "pose_semantics": "measured_first_frame_local_body_pose_v1",
+        "pose_source": pose_source,
         "pose_translation_unit": "meter",
         "pose_rotation_unit": "radian",
-        "pose_is_executed": False,
+        "pose_is_executed": True,
         "video.front.K": None,
         "video.front.body_from_camera": None,
         "K_front": None,
@@ -886,6 +868,8 @@ def _features(
         }
     features.update({
         ACTION_KEY: pose_feature,
+        CONTROL_KEY: {"dtype": "float32", "shape": [3],
+                      "names": {"axes": ["forward", "left", "yaw"]}},
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},
         "frame_index": {"dtype": "int64", "shape": [1], "names": None},
         "episode_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -1059,6 +1043,9 @@ def validate_output_root(root: Path, decode_videos: bool = False) -> dict[str, i
         action = np.asarray(table[ACTION_KEY].to_pylist(), dtype=np.float32)
         if not np.array_equal(state, action):
             raise ValueError(f"state/action mismatch: {parquet_path}")
+        commands = np.asarray(table[CONTROL_KEY].to_pylist(), dtype=np.float32)
+        if commands.shape != (length, 3) or not np.isfinite(commands).all():
+            raise ValueError(f"invalid raw commands: {parquet_path}")
         if not np.allclose(state[0], [0, 0, 0, 0, 0, 0, 1], atol=1e-6):
             raise ValueError(f"first pose is not identity: {parquet_path}")
         if not np.isfinite(state).all() or not np.allclose(
@@ -1075,6 +1062,8 @@ def validate_output_root(root: Path, decode_videos: bool = False) -> dict[str, i
                 decode=decode_videos,
             )
         extra = extras[episode_index]
+        if extra.get("pose_is_executed") is not True or not extra.get("pose_source"):
+            raise ValueError(f"missing measured pose provenance: {parquet_path}")
         if extra["episode_index"] != episode_index:
             raise ValueError(f"extras index mismatch at {root}: {episode_index}")
         camera_keys = extra.get("camera_keys")
@@ -1121,7 +1110,7 @@ def validate_output_dataset(output_dir: str | Path, decode_videos: bool = False)
     summary: dict[str, Any] = {}
     for split in ("train", "val_seen", "val_unseen"):
         root = _root_for_split(output, split)
-        if root.exists():
+        if (root / "meta" / "info.json").is_file():
             summary[split] = validate_output_root(root, decode_videos=decode_videos)
     if not summary:
         raise ValueError(f"no LeRobot roots found under {output}")
@@ -1210,7 +1199,7 @@ def _stage4_camera_contract(
 
 def scan_stage4_inventory(
     processed_root: str | Path,
-) -> tuple[list[Stage4EpisodeSource], dict[str, tuple[int, int]]]:
+) -> tuple[list[FourViewEpisodeSource], dict[str, tuple[int, int]]]:
     """Index metadata and first-row instructions without scanning images or full JSONLs."""
     root = Path(processed_root).resolve()
     manifest_path = root / "manifest.json"
@@ -1232,7 +1221,7 @@ def scan_stage4_inventory(
     if not isinstance(successful, list) or not successful:
         raise ValueError(f"no successful episodes in {manifest_path}")
 
-    preliminary: list[Stage4EpisodeSource] = []
+    preliminary: list[FourViewEpisodeSource] = []
     common_video_specs: dict[str, tuple[int, int]] | None = None
     seen_source_episodes: set[str] = set()
     entries = sorted(successful, key=lambda item: str(item.get("source_episode", "")))
@@ -1307,7 +1296,7 @@ def scan_stage4_inventory(
             split="train",
         )
         preliminary.append(
-            Stage4EpisodeSource(
+            FourViewEpisodeSource(
                 plan=plan,
                 raw_root=raw_root,
                 jsonl_path=jsonl_path,
@@ -1330,7 +1319,7 @@ def scan_stage4_inventory(
 
 
 def _load_stage4_episode(
-    source: Stage4EpisodeSource,
+    source: FourViewEpisodeSource,
     root: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, list[Path]]]:
     """Validate one episode in its worker; image content is checked during encoding."""
@@ -1394,15 +1383,112 @@ def _load_stage4_episode(
     return rows, image_paths
 
 
-def _process_stage4_episode(
-    source: Stage4EpisodeSource,
+def scan_raw_inventory(
+    raw_root: str | Path,
+) -> tuple[list[FourViewEpisodeSource], dict[str, tuple[int, int]]]:
+    """Index the same complete successful episodes accepted by EVT-Collect export."""
+    root = Path(raw_root).resolve()
+    sources = []
+    common_specs = None
+    skipped = 0
+    for status_path in sorted(root.glob("*/*/*/status.json")):
+        status = json.loads(status_path.read_text())
+        if status.get("state") != "complete" or status.get("success") is not True:
+            skipped += 1
+            continue
+        episode_dir = status_path.parent
+        seed, scene, episode = episode_dir.relative_to(root).parts
+        camera_path = episode_dir / "camera.json"
+        camera = json.loads(camera_path.read_text())
+        specs = _stage4_camera_contract(camera, camera_path)
+        if common_specs is None:
+            common_specs = specs
+        elif common_specs != specs:
+            raise ValueError(f"camera resolutions differ: {camera_path}")
+        identity = camera["episode"]
+        for label, value in (("scene", scene), ("episode_id", episode)):
+            if str(identity.get(label)) != value or str(status.get(label)) != value:
+                raise ValueError(f"raw {label} mismatch: {status_path}")
+        if seed != f"seed_{identity.get('seed')}" or identity.get("seed") != status.get("seed"):
+            raise ValueError(f"raw seed mismatch: {status_path}")
+        instruction = identity.get("instruction")
+        length = int(status.get("frame_count", 0))
+        if not isinstance(instruction, str) or not instruction or length <= 0:
+            raise ValueError(f"invalid raw instruction/frame_count: {status_path}")
+        jsonl_path = episode_dir / "steps.jsonl"
+        suffix = episode.rsplit("_", 1)[-1]
+        plan = EpisodePlan(
+            seed, scene, episode, int(suffix) if suffix.isdigit() else len(sources),
+            jsonl_path.relative_to(root).as_posix(), instruction, length, split="train",
+        )
+        sources.append(FourViewEpisodeSource(plan, root, jsonl_path, camera_path, camera, True))
+    if not sources:
+        raise ValueError(f"no complete successful raw episodes in {root}")
+    assigned = {p.jsonl_member: p for p in assign_root_indices([s.plan for s in sources])}
+    sources = [replace(s, plan=assigned[s.plan.jsonl_member]) for s in sources]
+    sources.sort(key=lambda s: s.plan.episode_index)
+    logging.info("Indexed %d raw episodes; skipped %d incomplete/unsuccessful", len(sources), skipped)
+    return sources, common_specs
+
+
+def load_raw_episode(source: FourViewEpisodeSource) -> list[dict[str, Any]]:
+    plan = source.plan
+    path = source.raw_root / plan.source_key / "steps.jsonl"
+    rows = _load_jsonl(path)
+    if len(rows) != plan.length:
+        raise ValueError(f"raw frame count mismatch: {path}: {len(rows)} != {plan.length}")
+    for index, row in enumerate(rows):
+        try:
+            if row["step_index"] != index or row["video_frame_index"] != index:
+                raise ValueError("step/video frame index mismatch")
+            if not math.isclose(float(row["sim_time_s"]), index / FPS, rel_tol=0, abs_tol=1e-9):
+                raise ValueError("sim_time_s mismatch")
+            command = np.asarray(row["base_velocity_normalized"], dtype=np.float64)
+            if command.shape != (3,) or not np.isfinite(command).all() or np.any(np.abs(command) > 1):
+                raise ValueError("invalid normalized command")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{path} row {index}: {exc}") from exc
+    return rows
+
+
+def copy_raw_video(source: Path, destination: Path, count: int, width: int, height: int) -> dict:
+    """Keep original pixels; one decode computes stats and verifies frame/timestamp alignment."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    validate_video_contract(destination, count, width=width, height=height, decode=False)
+    stats = ImageStats(width=width, height=height)
+    with av.open(str(destination)) as container:
+        stream = container.streams.video[0]
+        stream.codec_context.thread_count = 1
+        for index, frame in enumerate(container.decode(stream)):
+            if frame.time is None or not math.isclose(frame.time, index / FPS, rel_tol=0, abs_tol=1e-6):
+                raise ValueError(f"video timestamp mismatch: {source} frame {index}")
+            stats.update(frame.to_ndarray(format="rgb24"))
+    if stats.frame_count != count:
+        raise ValueError(f"decoded frame count mismatch: {source}: {stats.frame_count} != {count}")
+    return stats.finalize()
+
+
+def _process_four_view_episode(
+    source: FourViewEpisodeSource,
     processed_root: Path,
     output_dir: Path,
     video_specs: dict[str, tuple[int, int]],
 ) -> EpisodeResult:
     plan = source.plan
-    rows, image_paths = _load_stage4_episode(source, processed_root)
-    poses = integrate_nominal_poses(rows)
+    raw_rows = load_raw_episode(source)
+    if source.raw_video_input:
+        image_paths = {}
+    else:
+        rows, image_paths = _load_stage4_episode(source, processed_root)
+        for index, (row, raw) in enumerate(zip(rows, raw_rows)):
+            if not np.allclose(row["actions"][0], raw["base_velocity_normalized"], rtol=0, atol=1e-7):
+                raise ValueError(f"raw/Stage-4 command mismatch: {plan.source_key} row {index}")
+    try:
+        poses, pose_source = measured_local_poses(raw_rows)
+    except ValueError as exc:
+        raise ValueError(f"{plan.source_key}: {exc}") from exc
+    commands = np.asarray([row["base_velocity_normalized"] for row in raw_rows], dtype=np.float32)
     root = _root_for_split(output_dir, plan.split)
     parquet_path, _ = _episode_paths(root, plan.episode_index)
     video_paths = {
@@ -1416,21 +1502,25 @@ def _process_stage4_episode(
         partial.unlink(missing_ok=True)
     video_stats: dict[str, dict[str, Any]] = {}
     try:
-        write_episode_parquet(parquet_partial, plan, poses)
+        write_episode_parquet(parquet_partial, plan, poses, commands)
         for video_key, (width, height) in video_specs.items():
-            video_stats[video_key] = encode_video_from_paths(
-                video_partials[video_key],
-                image_paths[video_key],
-                width=width,
-                height=height,
-            )
-            validate_video_contract(
-                video_partials[video_key],
-                plan.length,
-                width=width,
-                height=height,
-                decode=True,
-            )
+            if source.raw_video_input:
+                view = STAGE4_VIDEO_VIEW_MAP[video_key]
+                episode_dir = source.jsonl_path.parent
+                video_source = _resolve_stage4_relative(
+                    episode_dir, source.camera_metadata["views"][view]["video_path"],
+                    f"{view} raw video",
+                )
+                video_stats[video_key] = copy_raw_video(
+                    video_source, video_partials[video_key], plan.length, width, height,
+                )
+            else:
+                video_stats[video_key] = encode_video_from_paths(
+                    video_partials[video_key], image_paths[video_key], width=width, height=height,
+                )
+                validate_video_contract(
+                    video_partials[video_key], plan.length, width=width, height=height, decode=True,
+                )
         parquet_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(parquet_partial, parquet_path)
         for video_key, final_path in video_paths.items():
@@ -1442,7 +1532,8 @@ def _process_stage4_episode(
         raise
 
     pose_stats = _numeric_stats(poses)
-    stats = {STATE_KEY: pose_stats, **video_stats, ACTION_KEY: pose_stats}
+    stats = {STATE_KEY: pose_stats, **video_stats, ACTION_KEY: pose_stats,
+             CONTROL_KEY: _numeric_stats(commands)}
     timing = source.camera_metadata["timing"]
     front_width, front_height = video_specs[VIDEO_KEY]
     extras: dict[str, Any] = {
@@ -1453,9 +1544,9 @@ def _process_stage4_episode(
         "source_raw_root": str(source.raw_root),
         "source_raw_episode": plan.source_key,
         "source_raw_episode_path": str(source.raw_root / Path(*PurePosixPath(plan.source_key).parts)),
-        "source_intermediate_schema_version": STAGE4_SCHEMA_VERSION,
-        "source_intermediate_jsonl": source.jsonl_path.relative_to(processed_root).as_posix(),
-        "source_intermediate_camera_metadata": source.camera_path.relative_to(processed_root).as_posix(),
+        "source_schema_version": (STAGE4_SOURCE_SCHEMA_VERSION if source.raw_video_input else STAGE4_SCHEMA_VERSION),
+        "source_jsonl": source.jsonl_path.relative_to(processed_root).as_posix(),
+        "source_camera_metadata": source.camera_path.relative_to(processed_root).as_posix(),
         "frame_count": plan.length,
         "fps": FPS,
         "frame_dt_s": 1.0 / FPS,
@@ -1470,10 +1561,11 @@ def _process_stage4_episode(
             source_view: video_key.removeprefix("video.")
             for video_key, source_view in STAGE4_VIDEO_VIEW_MAP.items()
         },
-        "pose_semantics": "controller_nominal_first_frame_local_body_pose",
+        "pose_semantics": "measured_first_frame_local_body_pose_v1",
+        "pose_source": pose_source,
         "pose_translation_unit": "meter",
         "pose_rotation_unit": "radian",
-        "pose_is_executed": False,
+        "pose_is_executed": True,
     }
     camera_views = source.camera_metadata["views"]
     for video_key, source_view in STAGE4_VIDEO_VIEW_MAP.items():
@@ -1487,15 +1579,16 @@ def _process_stage4_episode(
     return EpisodeResult(plan=plan, stats=stats, extras=extras)
 
 
-def convert_stage4_dataset(
+def convert_four_view_dataset(
     processed_root: str | Path,
     output_dir: str | Path,
     work_dir: str | Path = DEFAULT_WORK_DIR,
     *,
     workers: int = 4,
     overwrite: bool = False,
+    raw_video_input: bool = False,
 ) -> dict[str, Any]:
-    """Convert processed four-view v1 data directly into one LeRobot train root."""
+    """Convert raw MP4 or Stage-4 JPEG episodes into a direct LeRobot root."""
     processed_root = Path(processed_root).resolve()
     output_dir = Path(output_dir).resolve()
     work_dir = Path(work_dir).resolve()
@@ -1508,7 +1601,8 @@ def convert_stage4_dataset(
         raise FileExistsError(f"output already exists (use --overwrite): {output_dir}")
 
     logging.info("Reading processed four-view metadata: %s", processed_root)
-    sources, video_specs = scan_stage4_inventory(processed_root)
+    scanner = scan_raw_inventory if raw_video_input else scan_stage4_inventory
+    sources, video_specs = scanner(processed_root)
     plans = [source.plan for source in sources]
     staging_dir = work_dir / f"{output_dir.name}.stage4-staging-{os.getpid()}"
     if staging_dir.exists():
@@ -1530,7 +1624,7 @@ def convert_stage4_dataset(
         ) as executor:
             futures = [
                 executor.submit(
-                    _process_stage4_episode,
+                    _process_four_view_episode,
                     source,
                     processed_root,
                     staging_dir,
@@ -1578,7 +1672,7 @@ def convert_stage4_dataset(
         logging.error("Conversion failed; staging data retained at %s", staging_dir)
         raise
     return {
-        "input_format": STAGE4_SCHEMA_VERSION,
+        "input_format": STAGE4_SOURCE_SCHEMA_VERSION if raw_video_input else STAGE4_SCHEMA_VERSION,
         "processed_root": str(processed_root),
         "output_dir": str(output_dir),
         "video_keys": list(video_specs),
@@ -1706,12 +1800,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert legacy or processed four-view OmTrackVLA data to LeRobot v2.1"
     )
-    parser.add_argument(
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--raw-root", type=Path, help="EVT-Collect raw episode root; reuse four-view MP4s")
+    inputs.add_argument(
         "--processed-root",
         type=Path,
         help=(
             "OmTrackVLA processed_tracking.v1 directory. When set, read direct four-view "
-            "JPEG/JSONL files and write a single train root."
+            "JPEG/JSONL files plus original raw poses and write a direct LeRobot root."
         ),
     )
     parser.add_argument("--jsonl-archive", type=Path, default=DEFAULT_JSONL_ARCHIVE)
@@ -1748,9 +1844,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = validate_output_dataset(args.output_dir, decode_videos=args.decode_videos)
         print(_json_dump(summary, indent=2))
         return 0
-    if args.processed_root is not None:
-        result = convert_stage4_dataset(
-            processed_root=args.processed_root,
+    if args.processed_root is not None or args.raw_root is not None:
+        result = convert_four_view_dataset(
+            processed_root=args.raw_root if args.raw_root is not None else args.processed_root,
+            raw_video_input=args.raw_root is not None,
             output_dir=args.output_dir,
             work_dir=args.work_dir,
             workers=args.workers,

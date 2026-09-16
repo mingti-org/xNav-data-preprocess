@@ -19,7 +19,7 @@ SOURCE = "seed_9301/synthetic_scene/episode_000"
 
 
 def convert(processed, output, *, workers=2, overwrite=False):
-    return tracking.convert_stage4_dataset(
+    return tracking.convert_four_view_dataset(
         processed, output, output.parent / f"{output.name}-work",
         workers=workers, overwrite=overwrite,
     )
@@ -97,7 +97,7 @@ def test_out_of_order_completion_preserves_all_output_bytes(tmp_path, monkeypatc
     serial = tmp_path / "serial"
     parallel = tmp_path / "parallel"
     convert(processed, serial, workers=1)
-    real_process = tracking._process_stage4_episode
+    real_process = tracking._process_four_view_episode
     later_finished = threading.Event()
     completion_order = []
 
@@ -110,7 +110,7 @@ def test_out_of_order_completion_preserves_all_output_bytes(tmp_path, monkeypatc
             later_finished.set()
         return result
 
-    monkeypatch.setattr(tracking, "_process_stage4_episode", reverse_completion)
+    monkeypatch.setattr(tracking, "_process_four_view_episode", reverse_completion)
     with caplog.at_level(logging.INFO):
         convert(processed, parallel)
     assert completion_order == [1, 0]
@@ -119,7 +119,7 @@ def test_out_of_order_completion_preserves_all_output_bytes(tmp_path, monkeypatc
     original = {path.relative_to(serial): path.read_bytes() for path in serial.rglob("*") if path.is_file()}
     actual = {path.relative_to(parallel): path.read_bytes() for path in parallel.rglob("*") if path.is_file()}
     assert original == actual
-    table = pq.read_table(parallel / "train/data/chunk-000/episode_000000.parquet")
+    table = pq.read_table(parallel / "data/chunk-000/episode_000000.parquet")
     poses = np.array(table[tracking.ACTION_KEY].to_pylist())
     np.testing.assert_array_equal(poses[1], poses[2])
     np.testing.assert_array_equal(poses[2], poses[3])
