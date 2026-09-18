@@ -46,6 +46,14 @@ class EpisodeIterator:
     def __iter__(self) -> Iterator[tuple[dict, str]]:
         captures = {VIEWS[v]: cv2.VideoCapture(str(self.source.root / f"{v}.mp4")) for v in VIEWS}
         try:
+            for key, cap in captures.items():
+                if not cap.isOpened():
+                    raise ValueError(f"cannot open video: {key}")
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if (width, height) != (640, 480) or abs(fps - 10.0) > 0.2:
+                    raise ValueError(f"video metadata mismatch for {key}: {width}x{height}@{fps}")
             for i, step in enumerate(self.source.steps):
                 frame: dict = {}
                 for key, cap in captures.items():
@@ -59,6 +67,10 @@ class EpisodeIterator:
                 frame["action"] = np.asarray([step["discrete_action_to_next_id"]], dtype=np.int64)
                 frame["action_text"] = step["discrete_action_to_next"]
                 yield frame, self.task
+            for key, cap in captures.items():
+                extra, _ = cap.read()
+                if extra is not None:
+                    raise ValueError(f"video has extra frames after {len(self.source.steps)}: {key}")
         finally:
             for cap in captures.values():
                 cap.release()
