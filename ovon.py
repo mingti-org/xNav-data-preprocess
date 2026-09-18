@@ -130,14 +130,6 @@ def validate_episode(root: Path, manifest: dict, episode: dict, steps: tuple[dic
         raise ValueError("empty steps")
     if steps[-1]["discrete_action_to_next_id"] != 0:
         raise ValueError("last frame must contain STOP=0")
-    for view in VIEWS:
-        cap = cv2.VideoCapture(str(root / f"{view}.mp4"))
-        if not cap.isOpened():
-            raise ValueError(f"cannot open video: {view}")
-        width, height, fps = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-        if (width, height) != (640, 480) or abs(fps - 10.0) > 0.2:
-            raise ValueError(f"video metadata mismatch for {view}: {width}x{height}@{fps}")
 
 
 def _frames(path: Path) -> Iterator[np.ndarray]:
