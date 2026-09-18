@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -71,6 +72,7 @@ def discover(root: Path) -> tuple[list[SourceEpisode], list[dict]]:
     sources: list[SourceEpisode] = []
     errors: list[dict] = []
     seen: set[str] = set()
+    candidates: list[tuple[str, Path, dict, str, int]] = []
     for shard_root in sorted(root.glob("shard_*")):
         train = (shard_root / "train").resolve()
         manifest_path = train / "manifest.jsonl"
@@ -85,13 +87,24 @@ def discover(root: Path) -> tuple[list[SourceEpisode], list[dict]]:
             if key in seen:
                 raise ValueError(f"duplicate source episode key: {key}")
             seen.add(key)
-            try:
-                episode = json.loads((episode_root / "episode.json").read_text())
-                steps = tuple(_jsonl(episode_root / "steps.jsonl"))
-                validate_episode(episode_root, manifest, episode, steps)
-                sources.append(SourceEpisode(shard_root.name, manifest, episode_root, episode, steps, key))
-            except Exception as exc:
-                errors.append({"source_key": key, "stage": "source_validation", "error": repr(exc), "row": row_no})
+            candidates.append((shard_root.name, episode_root, manifest, key, row_no))
+
+    def validate_candidate(item: tuple[str, Path, dict, str, int]) -> SourceEpisode | dict:
+        shard, episode_root, manifest, key, row_no = item
+        try:
+            episode = json.loads((episode_root / "episode.json").read_text())
+            steps = tuple(_jsonl(episode_root / "steps.jsonl"))
+            validate_episode(episode_root, manifest, episode, steps)
+            return SourceEpisode(shard, manifest, episode_root, episode, steps, key)
+        except Exception as exc:
+            return {"source_key": key, "stage": "source_validation", "error": repr(exc), "row": row_no}
+
+    with ThreadPoolExecutor(max_workers=min(176, max(1, len(candidates)))) as pool:
+        for result in pool.map(validate_candidate, candidates):
+            if isinstance(result, SourceEpisode):
+                sources.append(result)
+            else:
+                errors.append(result)
     return sorted(sources, key=lambda x: x.source_key), errors
 
 
