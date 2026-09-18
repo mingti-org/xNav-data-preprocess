@@ -72,10 +72,6 @@ class EpisodeIterator:
                 frame["action"] = np.asarray([step["discrete_action_to_next_id"]], dtype=np.int64)
                 frame["action_text"] = step["discrete_action_to_next"]
                 yield frame, self.task
-            for key, cap in captures.items():
-                extra, _ = cap.read()
-                if extra is not None:
-                    raise ValueError(f"video has extra frames after {len(self.source.steps)}: {key}")
         finally:
             for cap in captures.values():
                 cap.release()
