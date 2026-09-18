@@ -99,13 +99,13 @@ def discover(root: Path) -> tuple[list[SourceEpisode], list[dict]]:
             if key in seen:
                 raise ValueError(f"duplicate source episode key: {key}")
             seen.add(key)
-        try:
-            episode = json.loads((episode_root / "episode.json").read_text())
-            steps = tuple(_jsonl(episode_root / "steps.jsonl"))
-            validate_episode(episode_root, manifest, episode, steps)
-            sources.append(SourceEpisode(shard_root.name, manifest, episode_root, episode, steps, key))
-        except Exception as exc:
-            errors.append({"source_key": key, "stage": "source_validation", "error": repr(exc), "row": row_no})
+            try:
+                episode = json.loads((episode_root / "episode.json").read_text())
+                steps = tuple(_jsonl(episode_root / "steps.jsonl"))
+                validate_episode(episode_root, manifest, episode, steps)
+                sources.append(SourceEpisode(shard_root.name, manifest, episode_root, episode, steps, key))
+            except Exception as exc:
+                errors.append({"source_key": key, "stage": "source_validation", "error": repr(exc), "row": row_no})
     return sorted(sources, key=lambda x: x.source_key), errors
 
 
