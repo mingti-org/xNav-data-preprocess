@@ -18,6 +18,12 @@ from utils.lerobot.lerobot_creater import LeRobotCreator
 
 VIEWS = {"front": "video.front", "back": "video.rear", "left": "video.left", "right": "video.right"}
 ACTION_NAMES = {0: "STOP", 1: "forward", 2: "turn_left", 3: "turn_right"}
+ACTION_ALIASES = {
+    0: {"STOP", "stop"},
+    1: {"forward", "move_forward"},
+    2: {"turn_left"},
+    3: {"turn_right"},
+}
 
 
 @dataclass(frozen=True)
@@ -130,7 +136,7 @@ def validate_episode(root: Path, manifest: dict, episode: dict, steps: tuple[dic
         if step["step_index"] != i or step["video_frame_index"] != i:
             raise ValueError(f"non-contiguous frame index at {i}")
         action_id = int(step["discrete_action_to_next_id"])
-        if action_id not in ACTION_NAMES or step["discrete_action_to_next"] != ACTION_NAMES[action_id]:
+        if action_id not in ACTION_ALIASES or step["discrete_action_to_next"] not in ACTION_ALIASES[action_id]:
             raise ValueError(f"unknown/inconsistent action at {i}")
         if not np.allclose(npz["positions"][i], step["position"], atol=1e-5):
             raise ValueError(f"position conflict at {i}")
