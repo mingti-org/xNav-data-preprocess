@@ -1,8 +1,10 @@
-from abc import ABC, abstractmethod
-from typing import Iterable, Tuple
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from __future__ import annotations
 
-from .rgb_pose_dataset import RGBPosePoint, RGBPoseSourceInfo, RGBPoseTrajectory, RGBPoseTrajectorySource
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Iterable, Tuple
+
+if TYPE_CHECKING:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 def get_task_idx(ds: LeRobotDataset, task: str) -> int:
     """Get the index of a task, adding it if it doesn't exist."""

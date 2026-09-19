@@ -285,3 +285,147 @@ def create_rxr_replay_source(
     with gzip.open(annotation_path, "wt", encoding="utf-8") as handle:
         json.dump({"episodes": annotations}, handle, ensure_ascii=False)
     return source_root, annotation_path
+
+
+def create_scalevln_replay_source(
+    root: Path, *, split: str = "train", instruction_prefix: str = "sc"
+) -> Path:
+    """ScaleVLN replay export: graph-only maps and one null-language instruction.
+
+    Mirrors the real ScaleVLN raw contract: ``scene_map_paths.levels`` is empty,
+    only the navmesh graph and its trajectory overlay are exported, every step
+    carries ``floor_level_id == -1``, and instructions have no ``language``.
+    """
+    split_root = root / split
+    scene_root = split_root / "scenes" / "TestScene"
+    image_size = (20, 10)
+
+    graph_directory = scene_root / "graph_floor_0p000"
+    graph_path = graph_directory / "graph.png"
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", image_size, (70, 80, 90)).save(graph_path)
+    write_json(
+        graph_directory / "meta.json",
+        {
+            "scene_key": "TestScene",
+            "height": 0.0,
+            "height_key": "0p000",
+            "bounds": {"lower": [0.0, -1.0, -9.0], "upper": [19.0, 1.0, 0.0]},
+            "shape": [image_size[1], image_size[0]],
+            "meters_per_pixel": 1.0,
+            "width": image_size[0],
+            "height_pixels": image_size[1],
+            "projection": "canonical_pathfinder_bounds",
+            "scale_pixels_per_meter": 1.0,
+        },
+    )
+
+    manifest: list[dict] = []
+    for trajectory_index, name in enumerate(("scalevln_a", "scalevln_b")):
+        episode_dir_name = f"hm3d_TestScene_traj_{name}"
+        episode_rel = Path("episodes") / split / episode_dir_name
+        episode_dir = split_root / episode_rel
+        overlays = episode_dir / "overlays"
+        overlays.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", image_size, (160, 170, 180)).save(
+            overlays / "trajectory_on_graph_floor_0p000.png"
+        )
+
+        for view in ("front", "back", "left", "right"):
+            write_video(episode_dir / f"{view}.mp4")
+
+        steps = [
+            {
+                "step_index": 0,
+                "position": [0.0, 0.0, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "discrete_action_to_next": "move_forward",
+                "discrete_action_to_next_id": 1,
+                "video_frame_index": 0,
+                "map_xy": [0, 9],
+                "graph_xy": [0, 9],
+                "floor_level_id": -1,
+                "floorplan_xy": [0, 9],
+            },
+            {
+                "step_index": 1,
+                "position": [0.0, 0.0, -1.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "discrete_action_to_next": "STOP",
+                "discrete_action_to_next_id": 0,
+                "video_frame_index": 1,
+                "map_xy": [0, 8],
+                "graph_xy": [0, 8],
+                "floor_level_id": -1,
+                "floorplan_xy": [0, 8],
+            },
+        ]
+        write_jsonl(episode_dir / "steps.jsonl", steps)
+
+        instruction_id = f"{instruction_prefix}_{trajectory_index}"
+        overlay_paths = [
+            str(episode_rel / "overlays" / "trajectory_on_graph_floor_0p000.png")
+        ]
+        episode = {
+            "dataset": "scalevln",
+            "role": None,
+            "split": split,
+            "episode_id": instruction_id,
+            "episode_ids": [instruction_id],
+            "trajectory_id": name,
+            "scene_id": "hm3d/TestScene/TestScene.basis.glb",
+            "scene_key": "TestScene",
+            "instructions": [
+                {
+                    "episode_id": instruction_id,
+                    "trajectory_id": name,
+                    "instruction": f"instruction for {name}",
+                    "language": None,
+                }
+            ],
+            "num_steps": 2,
+            "num_frames": 2,
+            "video_hfov": 120.0,
+            "video_views": ["front", "back", "left", "right"],
+            "video_width": 16,
+            "video_height": 12,
+            "video_fps": 10,
+            "scene_map_paths": {
+                "levels": {},
+                "graph_floor": {
+                    "height": 0.0,
+                    "height_key": "0p000",
+                    "directory": "scenes/TestScene/graph_floor_0p000",
+                    "graph": "scenes/TestScene/graph_floor_0p000/graph.png",
+                },
+            },
+            "overlay_paths": overlay_paths,
+            "success": True,
+            "map_projection": "canonical_pathfinder_bounds",
+            "map_size": {"width": image_size[0], "height": image_size[1]},
+        }
+        write_json(episode_dir / "episode.json", episode)
+        manifest.append(
+            {
+                "dataset": "scalevln",
+                "role": None,
+                "split": split,
+                "episode_id": instruction_id,
+                "episode_ids": [instruction_id],
+                "trajectory_id": name,
+                "scene_id": episode["scene_id"],
+                "scene_key": "TestScene",
+                "episode_dir_name": episode_dir_name,
+                "episode_dir": str(episode_rel),
+                "video_hfov": 120.0,
+                "video_views": ["front", "back", "left", "right"],
+                "num_steps": 2,
+                "num_frames": 2,
+                "num_instructions": 1,
+                "overlay_paths": overlay_paths,
+            }
+        )
+
+    write_jsonl(split_root / "manifest.jsonl", manifest)
+    write_jsonl(split_root / "errors.jsonl", [])
+    return root

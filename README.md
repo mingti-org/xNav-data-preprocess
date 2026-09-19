@@ -63,3 +63,41 @@ wrapper 直接写入 `processed_v2/r2r` 与 `processed_v2/rxr`，不会增加中
 
 默认拒绝写入已存在的 split。中断后只可在 conversion context 完全一致时使用
 `--resume`；`--overwrite` 会删除并重建所选 split，使用前应单独确认目标路径。
+
+### ScaleVLN replay
+
+同一入口支持 `--dataset-name scalevln`。`--input-root` 可以指向一个含有
+`train/manifest.jsonl` 的单 shard，也可以指向含有 `shard_*/train/manifest.jsonl`
+的总目录。总目录按 shard 名字排序、按各自 manifest 顺序转换成一份数据集，
+episode、task 和全局帧索引统一连续编号；重复的指令 episode ID 会在写出前报错。
+同一输入目录同时包含直接 split 和 shard 时会报错，避免遗漏或重复转换。
+
+ScaleVLN 复用 R2R/RxR 的位姿、动作、四视角视频和 Parquet 输出合同，地图只要求
+`graph.png` 与对应的轨迹覆盖图。投影由每条轨迹所属 shard 的 graph metadata
+重建，并继续与记录的像素坐标核对。R2R/RxR 仍要求原来的六张地图，RxR 仍按权威
+标注只保留英文指令。
+
+ScaleVLN 的 `floor_level_id=-1` 表示没有楼层标注，不作为单层证明。该数据集不做
+楼层筛选，报告写入 `floor_filter="not_applied"`、
+`floor_filter_reason="source_has_no_floor_metadata"` 和 `eligible_source_episodes`，
+不输出单层/多层筛选计数。Python 接口的 `skip_preflight=True` 使用相同规则，
+实际转换仍校验所选轨迹的 steps、位姿、动作和地图投影。
+
+只转换成功 manifest 中的记录，各 shard 的 `errors.jsonl` 数量汇总为
+`source_recorded_errors`。`source_episode_dir` 在多 shard 输入时包含
+`shard_*/train/` 前缀；resume 会检查 shard 列表和每条输出的来源，不能把另一个
+shard 的单独转换追加到已有输出中。
+
+```bash
+python map2nav_vlnce.py \
+  --input-root /data1/glx/Enactive/datasets/train/scalevln/raw/0918_scalevln_40k \
+  --output-root /path/to/processed/scalevln \
+  --dataset-name scalevln \
+  --split train \
+  --flat-output \
+  --num-workers 32
+```
+
+这个转换器直接写 Parquet 并复制视频，不调用 LeRobot SDK。所用 Python 环境需要
+NumPy、SciPy、Pillow、PyArrow 和 tqdm；定向测试另外需要 pytest、pandas 和 OpenCV。
+仓库中使用 LeRobot SDK 的其他转换入口仍需要各自的依赖。

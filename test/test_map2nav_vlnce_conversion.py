@@ -374,6 +374,23 @@ def test_rxr_conversion_requires_authoritative_language_annotations(tmp_path: Pa
     assert not (output_root / "train").exists()
 
 
+@pytest.mark.parametrize("dataset_name", ["r2r", "rxr_guide"])
+def test_existing_datasets_still_require_floorplan_assets(
+    tmp_path: Path, dataset_name: str
+) -> None:
+    kwargs = {}
+    if dataset_name == "rxr_guide":
+        source_root, annotations = create_rxr_replay_source(tmp_path / "source")
+        kwargs["rxr_annotations"] = annotations
+    else:
+        source_root = create_replay_source(tmp_path / "source")
+    (source_root / "train/scenes/TestScene/level_0/detail.png").unlink()
+    with pytest.raises(SourceSchemaError, match="floorplan_detail map asset"):
+        convert_dataset(
+            source_root, tmp_path / "processed", dataset_name, "train", **kwargs,
+        )
+
+
 def test_rxr_cli_accepts_authoritative_annotations(tmp_path: Path) -> None:
     source_root, annotation_path = create_rxr_replay_source(tmp_path / "source")
     output_root = tmp_path / "processed" / "rxr_guide"

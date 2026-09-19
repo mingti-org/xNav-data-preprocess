@@ -19,6 +19,21 @@ MAP_ASSET_KEYS = (
     "floorplan_detail",
     "floorplan_detail_overlay",
 )
+# ScaleVLN replay only exports the navmesh graph and its trajectory overlay, so
+# its map contract is a strict subset of the Map2Nav floorplan asset set.
+SCALEVLN_MAP_ASSET_KEYS = (
+    "graph",
+    "graph_overlay",
+)
+
+
+def map_asset_keys(dataset_name: str) -> tuple[str, ...]:
+    """Return the required map asset keys for one source dataset."""
+    if dataset_name == "scalevln":
+        return SCALEVLN_MAP_ASSET_KEYS
+    return MAP_ASSET_KEYS
+
+
 RGB_VIEW_MAP = {
     "front": "front",
     "left": "left",

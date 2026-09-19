@@ -11,7 +11,7 @@ import re
 import shutil
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,12 +23,12 @@ from .assets import project_world_positions, resolve_map_bundle
 from .coordinates import habitat_poses_to_xnav
 from .filtering import FloorEligibility, SourceSchemaError, classify_floor_levels
 from .schema import (
-    MAP_ASSET_KEYS,
     RGB_VIEW_MAP,
     SCHEMA_VERSION,
     VideoInfo,
     build_features,
     build_modality,
+    map_asset_keys,
     numeric_stats,
     write_episode_parquet,
 )
@@ -37,7 +37,11 @@ RXR_ENGLISH_LANGUAGES = ("en-IN", "en-US")
 EXPECTED_SOURCE_IDENTITIES = {
     "r2r": frozenset({("r2r", None)}),
     "rxr_guide": frozenset({("rxr", "guide"), ("rxr_en", "guide")}),
+    "scalevln": frozenset({("scalevln", None)}),
 }
+SCALEVLN_FLOOR_ELIGIBILITY = FloorEligibility(
+    accepted=True, source_level_id=None, visited_levels=(), reason=None
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class SourceInstruction:
 @dataclass(frozen=True)
 class SourceEpisode:
     manifest_index: int
+    split_root: Path
     episode_dir: Path
     episode_dir_relative: str
     trajectory_id: str
@@ -82,7 +87,7 @@ def convert_dataset(
     rxr_annotations: str | Path | None = None,
     flat_output: bool = False,
 ) -> Path:
-    """Convert one replay split into stable Map2Nav VLN-CE data."""
+    """Convert a replay split, combining ScaleVLN shards when present."""
 
     if resume and overwrite:
         raise ValueError("--resume and --overwrite are mutually exclusive")
@@ -94,9 +99,9 @@ def convert_dataset(
         raise ValueError("max_episodes must be positive when provided")
     if split not in {"train", "val_seen", "val_unseen"}:
         raise ValueError(f"unsupported split: {split!r}")
-    if dataset_name not in {"r2r", "rxr_guide"}:
+    if dataset_name not in {"r2r", "rxr_guide", "scalevln"}:
         raise ValueError(f"unsupported dataset_name: {dataset_name!r}")
-    if dataset_name == "r2r" and rxr_annotations is not None:
+    if dataset_name != "rxr_guide" and rxr_annotations is not None:
         raise ValueError("rxr_annotations is only valid for dataset_name='rxr_guide'")
 
     input_root = Path(input_root).resolve()
@@ -112,8 +117,8 @@ def convert_dataset(
         annotation_path = Path(rxr_annotations).resolve()
         annotation_index = _load_rxr_annotations(annotation_path)
         annotation_context = _file_identity(annotation_path)
-    split_root = input_root / split
-    source_errors = _read_source_errors(split_root)
+    split_roots = _source_split_roots(input_root, dataset_name=dataset_name, split=split)
+    source_errors = [error for root in split_roots for error in _read_source_errors(root)]
     dataset_root = output_root if flat_output else output_root / split
     preexisting_output = dataset_root.exists()
     if preexisting_output and not overwrite and not resume:
@@ -133,6 +138,10 @@ def convert_dataset(
         "rxr_languages": list(RXR_ENGLISH_LANGUAGES) if dataset_name == "rxr_guide" else None,
         "rxr_annotations": annotation_context,
     }
+    if dataset_name == "scalevln":
+        conversion_context["source_splits"] = [
+            root.relative_to(input_root).as_posix() for root in split_roots
+        ]
     if preexisting_output and resume and context_path.is_file():
         existing_context = _read_json(context_path)
         for key, value in conversion_context.items():
@@ -146,21 +155,28 @@ def convert_dataset(
             f"cannot resume non-empty output without conversion context: {dataset_root}"
         )
 
-    candidates = (
-        _scan_manifest_fast(
+    scan_source = _scan_manifest_fast if skip_preflight else _scan_source
+    candidates: list[SourceEpisode] = []
+    for split_root in split_roots:
+        shard_candidates = scan_source(
             split_root,
             dataset_name=dataset_name,
             split=split,
             annotation_index=annotation_index,
         )
-        if skip_preflight
-        else _scan_source(
-            split_root,
-            dataset_name=dataset_name,
-            split=split,
-            annotation_index=annotation_index,
-        )
-    )
+        for candidate in shard_candidates:
+            relative = candidate.episode_dir_relative
+            if split_root != input_root / split:
+                relative = (
+                    split_root.relative_to(input_root) / relative
+                ).as_posix()
+            candidates.append(
+                replace(
+                    candidate,
+                    manifest_index=len(candidates),
+                    episode_dir_relative=relative,
+                )
+            )
     selected_source_ids = [
         instruction.episode_id
         for candidate in candidates
@@ -168,10 +184,10 @@ def convert_dataset(
     ]
     if len(selected_source_ids) != len(set(selected_source_ids)):
         raise SourceSchemaError("selected source instruction episode_ids are not globally unique")
-    single_floor = [candidate for candidate in candidates if candidate.eligibility.accepted]
+    eligible_sources = [candidate for candidate in candidates if candidate.eligibility.accepted]
     eligible_episodes = [
         ConversionEpisode(source=candidate, instruction=instruction)
-        for candidate in single_floor
+        for candidate in eligible_sources
         for instruction in candidate.selected_instructions
     ]
     selected = eligible_episodes[:max_episodes]
@@ -222,7 +238,6 @@ def convert_dataset(
             return fragment, False
         _remove_episode_outputs(dataset_root, episode_index, chunk_size)
         fragment = _convert_episode(
-            split_root=split_root,
             dataset_root=dataset_root,
             staging_root=staging_root,
             candidate=candidate,
@@ -290,7 +305,7 @@ def convert_dataset(
         video=expected_video,
         fragments=fragments,
         candidates=candidates,
-        single_floor=single_floor,
+        eligible_sources=eligible_sources,
         eligible_episodes=eligible_episodes,
         skipped=skipped,
         source_error_count=len(source_errors),
@@ -302,6 +317,18 @@ def convert_dataset(
     if error_path.exists():
         error_path.unlink()
     return dataset_root
+
+
+def _source_split_roots(
+    input_root: Path, *, dataset_name: str, split: str
+) -> list[Path]:
+    direct = input_root / split
+    if dataset_name != "scalevln":
+        return [direct]
+    shards = [root / split for root in sorted(input_root.glob("shard_*")) if root.is_dir()]
+    if direct.exists() and shards:
+        raise SourceSchemaError("ScaleVLN input contains both direct and sharded splits")
+    return shards or [direct]
 
 
 def _scan_source(
@@ -341,10 +368,15 @@ def _scan_source(
                 source_dir=episode_dir,
             )
         )
-        eligibility = classify_floor_levels(steps)
+        eligibility = (
+            SCALEVLN_FLOOR_ELIGIBILITY
+            if dataset_name == "scalevln"
+            else classify_floor_levels(steps)
+        )
         candidates.append(
             SourceEpisode(
                 manifest_index=manifest_index,
+                split_root=split_root,
                 episode_dir=episode_dir,
                 episode_dir_relative=str(relative),
                 trajectory_id=str(episode.get("trajectory_id", "")),
@@ -405,30 +437,34 @@ def _scan_manifest_fast(
                 source_dir=episode_dir,
             )
         )
-        overlay_paths = row.get("overlay_paths", [])
-        level_ids = tuple(
-            sorted(
-                {
-                    int(match.group(1))
-                    for path in overlay_paths
-                    if (match := re.search(r"(?:layout|detail)_level_(\d+)", str(path)))
-                }
+        if dataset_name == "scalevln":
+            eligibility = SCALEVLN_FLOOR_ELIGIBILITY
+        else:
+            overlay_paths = row.get("overlay_paths", [])
+            level_ids = tuple(
+                sorted(
+                    {
+                        int(match.group(1))
+                        for path in overlay_paths
+                        if (match := re.search(r"(?:layout|detail)_level_(\d+)", str(path)))
+                    }
+                )
             )
-        )
-        if not level_ids:
-            raise SourceSchemaError(f"manifest has no floor overlay levels: {episode_dir}")
-        eligibility = FloorEligibility(
-            accepted=len(level_ids) == 1,
-            source_level_id=level_ids[0] if len(level_ids) == 1 else None,
-            visited_levels=level_ids,
-            reason=None if len(level_ids) == 1 else "multi_floor",
-        )
+            if not level_ids:
+                raise SourceSchemaError(f"manifest has no floor overlay levels: {episode_dir}")
+            eligibility = FloorEligibility(
+                accepted=len(level_ids) == 1,
+                source_level_id=level_ids[0] if len(level_ids) == 1 else None,
+                visited_levels=level_ids,
+                reason=None if len(level_ids) == 1 else "multi_floor",
+            )
         length = int(row.get("num_steps", 0))
         if length <= 0:
             raise SourceSchemaError(f"episode has invalid num_steps: {episode_dir}")
         candidates.append(
             SourceEpisode(
                 manifest_index=manifest_index,
+                split_root=split_root,
                 episode_dir=episode_dir,
                 episode_dir_relative=str(relative),
                 trajectory_id=str(row.get("trajectory_id", "")),
@@ -518,7 +554,7 @@ def _select_source_instructions(
             text=text,
             language=language,
         )
-        if dataset_name == "r2r" or language in RXR_ENGLISH_LANGUAGES:
+        if dataset_name in {"r2r", "scalevln"} or language in RXR_ENGLISH_LANGUAGES:
             selected.append(instruction)
 
     return len(raw_instructions), tuple(sorted(languages)), tuple(selected)
@@ -526,7 +562,6 @@ def _select_source_instructions(
 
 def _convert_episode(
     *,
-    split_root: Path,
     dataset_root: Path,
     staging_root: Path,
     candidate: ConversionEpisode,
@@ -541,14 +576,22 @@ def _convert_episode(
     instruction = candidate.instruction
     episode = _read_json(source_episode.episode_dir / "episode.json")
     steps = _read_jsonl(source_episode.episode_dir / "steps.jsonl")
-    eligibility = classify_floor_levels(steps)
-    if not eligibility.accepted or eligibility.source_level_id is None:
-        raise SourceSchemaError(
-            f"accepted source episode changed floor eligibility: {source_episode.episode_dir}"
-        )
+    source_level_id = None
+    if dataset_name != "scalevln":
+        eligibility = classify_floor_levels(steps)
+        if not eligibility.accepted or eligibility.source_level_id is None:
+            raise SourceSchemaError(
+                f"accepted source episode changed floor eligibility: {source_episode.episode_dir}"
+            )
+        source_level_id = eligibility.source_level_id
     _validate_steps(steps, episode=episode, manifest=None, source_dir=source_episode.episode_dir)
     _validate_selected_instruction(episode, instruction, source_dir=source_episode.episode_dir)
-    bundle = resolve_map_bundle(split_root, episode, eligibility.source_level_id)
+    bundle = resolve_map_bundle(
+        source_episode.split_root,
+        episode,
+        source_level_id,
+        dataset_name=dataset_name,
+    )
     positions = np.asarray([step["position"] for step in steps], dtype=np.float64)
     rotations = np.asarray([step["rotation"] for step in steps], dtype=np.float64)
     source_pixels = np.asarray([step["floorplan_xy"] for step in steps], dtype=np.int32)
@@ -596,7 +639,7 @@ def _convert_episode(
         staged_files[relative.as_posix()] = stage_path
 
     map_assets: dict[str, str] = {}
-    for key in MAP_ASSET_KEYS:
+    for key in map_asset_keys(dataset_name):
         relative = Path("maps") / f"chunk-{chunk:03d}" / episode_name / f"{key}.png"
         stage_path = stage / f"map.{key}.png"
         _copy_file(bundle.sources[key], stage_path)
@@ -724,7 +767,7 @@ def _write_final_metadata(
     video: VideoInfo,
     fragments: list[dict[str, Any]],
     candidates: list[SourceEpisode],
-    single_floor: list[SourceEpisode],
+    eligible_sources: list[SourceEpisode],
     eligible_episodes: list[ConversionEpisode],
     skipped: list[SourceEpisode],
     source_error_count: int,
@@ -786,11 +829,11 @@ def _write_final_metadata(
                 "selected_instruction_count": 0,
                 "source_languages": list(candidate.source_languages),
             }
-            for candidate in single_floor
+            for candidate in eligible_sources
             if not candidate.selected_instructions
         ],
     )
-    selected_single_floor = [candidate for candidate in single_floor if candidate.selected_instructions]
+    selected_sources = [candidate for candidate in eligible_sources if candidate.selected_instructions]
     eligible_language_counts = Counter(
         episode.instruction.language
         for episode in eligible_episodes
@@ -800,6 +843,23 @@ def _write_final_metadata(
         fragment["extras"]["instructions"][0].get("language")
         for fragment in fragments
         if fragment["extras"]["instructions"][0].get("language") is not None
+    )
+    floor_report = (
+        {
+            "floor_filter": "not_applied",
+            "floor_filter_reason": "source_has_no_floor_metadata",
+            "eligible_source_episodes": len(eligible_sources),
+        }
+        if dataset_name == "scalevln"
+        else {
+            "eligible_single_floor": len(eligible_sources),
+            "eligible_single_floor_with_selected_instructions": len(selected_sources),
+            "language_filtered_single_floor": len(eligible_sources) - len(selected_sources),
+            "skipped_multi_floor": len(skipped),
+            "skipped_multi_floor_selected_instructions": sum(
+                len(candidate.selected_instructions) for candidate in skipped
+            ),
+        }
     )
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -816,18 +876,12 @@ def _write_final_metadata(
         "selected_instruction_total_before_floor_filter": sum(
             len(candidate.selected_instructions) for candidate in candidates
         ),
-        "eligible_single_floor": len(single_floor),
-        "eligible_single_floor_with_selected_instructions": len(selected_single_floor),
-        "language_filtered_single_floor": len(single_floor) - len(selected_single_floor),
+        **floor_report,
         "eligible_instruction_episodes": len(eligible_episodes),
         "eligible_instruction_language_counts": dict(sorted(eligible_language_counts.items())),
         "accepted": total_episodes,
         "accepted_frames": total_frames,
         "accepted_instruction_language_counts": dict(sorted(accepted_language_counts.items())),
-        "skipped_multi_floor": len(skipped),
-        "skipped_multi_floor_selected_instructions": sum(
-            len(candidate.selected_instructions) for candidate in skipped
-        ),
         "unconverted_eligible_instruction_episodes_due_to_limit": (
             len(eligible_episodes) - total_episodes
         ),

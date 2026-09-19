@@ -7,14 +7,17 @@ from utils.map2nav_vlnce import convert_dataset
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert single-floor Map2Nav VLN-CE replay data to stable xNav data."
+        description="Convert R2R/RxR or ScaleVLN replay data to stable xNav data."
     )
-    parser.add_argument("--input-root", required=True, help="Replay root containing split folders")
+    parser.add_argument(
+        "--input-root", required=True,
+        help="Replay root containing split folders, or a ScaleVLN root containing shard_* folders",
+    )
     parser.add_argument("--output-root", required=True, help="Dataset output root")
     parser.add_argument(
         "--dataset-name",
         required=True,
-        choices=["r2r", "rxr_guide"],
+        choices=["r2r", "rxr_guide", "scalevln"],
         help="Stable source dataset name",
     )
     parser.add_argument(
