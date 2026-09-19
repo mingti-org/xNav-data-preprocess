@@ -25,4 +25,5 @@ cd "${repo_root}"
 exec "${repo_root}/.venv/bin/python" "${repo_root}/ovon.py" \
   --input-root "${input_root}" \
   --output-root "${output_root}" \
+  --dataset-name ovon \
   --num-workers "${workers}"

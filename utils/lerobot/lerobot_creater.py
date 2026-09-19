@@ -1,9 +1,8 @@
 import multiprocessing as mp
 import shutil
-import time
-import queue # For access to queue.Empty if needed, though mp.Queue handles it.
 import logging
 import traceback
+from queue import Empty
 from pathlib import Path
 from typing import Dict, Any, Callable, Iterator, Optional, Union, Tuple, List
 import numpy as np
@@ -49,14 +48,18 @@ class MetadataClient:
         self.resp_queue = resp_queue 
         self.rank = rank
 
+    def _request(self, command: str, args: Any) -> Any:
+        self.req_queue.put((command, args, self.rank))
+        ok, payload = self.resp_queue.get()
+        if not ok:
+            raise RuntimeError(payload)
+        return payload
+
     def allocate_episode_index(self) -> int:
-        # Pass rank instead of queue object
-        self.req_queue.put((CMD_ALLOCATE_EPISODE, None, self.rank))
-        return self.resp_queue.get()
+        return self._request(CMD_ALLOCATE_EPISODE, None)
 
     def add_task(self, task: str) -> int:
-        self.req_queue.put((CMD_ADD_TASK, task, self.rank))
-        return self.resp_queue.get()
+        return self._request(CMD_ADD_TASK, task)
 
     def append_episode(self, ep_dict: Dict):
         self.req_queue.put((CMD_APPEND_EPISODE, ep_dict, None))
@@ -151,12 +154,7 @@ class WorkerEpisodeBuilder:
             return
 
         # Ensure all images are written
-        self.image_writer.wait_until_done()
-        # AsyncImageWriter.stop() might kill executor? 
-        # We need to make sure we don't kill it if we reuse it? 
-        # But we create one per Builder (per Episode). So it's fine.
-        # Actually image_writer shutdown handling needs care.
-        # Assuming wait_until_done() is sufficient.
+        self.image_writer.stop()
         
         # Resolve Tasks via Metadata Process
         unique_tasks = list(self.tasks_set)
@@ -188,14 +186,11 @@ class WorkerEpisodeBuilder:
                 elif key in self.image_keys:
                     stats_buffer[key] = self.image_buffer[key]
             
-            try:
-                ep_stats = compute_episode_stats(stats_buffer, self.features)
-                self.meta.append_episode_stats({
-                    "episode_index": self.episode_index,
-                    "stats": ep_stats
-                })
-            except Exception as e:
-                logging.error(f"Stats computation failed for ep {self.episode_index}: {e}")
+            ep_stats = compute_episode_stats(stats_buffer, self.features)
+            self.meta.append_episode_stats({
+                "episode_index": self.episode_index,
+                "stats": ep_stats
+            })
         
         # Submit Video Encoding Jobs
         for key in self.image_keys:
@@ -204,7 +199,16 @@ class WorkerEpisodeBuilder:
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / f"episode_{self.episode_index:06d}.mp4"
             
-            self.video_queue.put((str(temp_dir), str(out_path), self.fps, self.codec, self.pix_fmt))
+            self.video_queue.put(
+                (
+                    str(temp_dir),
+                    str(out_path),
+                    self.fps,
+                    self.codec,
+                    self.pix_fmt,
+                    self.extra_metadata.get("source_episode_key"),
+                )
+            )
 
         # Update Meta
         self.meta.append_episode({
@@ -222,7 +226,23 @@ class WorkerEpisodeBuilder:
 
 # --- Service Entry Points ---
 
-def metadata_service(root: Path, req_queue: mp.Queue, reply_queues: List[mp.Queue]):
+def _report_process_error(error_queue: mp.Queue, stage: str, exc: BaseException, **context):
+    error_queue.put(
+        {
+            "stage": stage,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            **context,
+        }
+    )
+
+
+def metadata_service(
+    root: Path,
+    req_queue: mp.Queue,
+    reply_queues: List[mp.Queue],
+    error_queue: mp.Queue,
+):
     """Entry point for the Metadata Manager Process."""
     try:
         meta = LeRobotMetadata(root)
@@ -239,6 +259,7 @@ def metadata_service(root: Path, req_queue: mp.Queue, reply_queues: List[mp.Queu
                 break
             
             res = None
+            ok = True
             try:
                 if cmd == CMD_ALLOCATE_EPISODE:
                     res = meta.allocate_episode_index()
@@ -253,18 +274,22 @@ def metadata_service(root: Path, req_queue: mp.Queue, reply_queues: List[mp.Queu
                 elif cmd == CMD_UPDATE_GLOBAL:
                     meta.update_global_stats(args[0], args[1])
             except Exception as e:
+                ok = False
+                res = f"metadata command {cmd!r} failed: {e}"
+                _report_process_error(error_queue, "metadata", e, command=cmd)
                 logging.error(f"Metadata Service Error: {e}")
                 traceback.print_exc()
             
             if rank is not None:
                 # Reply to the specific worker rank
-                reply_queues[rank].put(res)
+                reply_queues[rank].put((ok, res))
                 
     except Exception as e:
+        _report_process_error(error_queue, "metadata_process", e)
         logging.critical(f"Metadata Process Failed: {e}")
         traceback.print_exc()
 
-def video_encoder_service(video_queue: mp.JoinableQueue):
+def video_encoder_service(video_queue: mp.JoinableQueue, error_queue: mp.Queue):
     """Entry point for Video Encoder Processes."""
     while True:
         try:
@@ -277,7 +302,7 @@ def video_encoder_service(video_queue: mp.JoinableQueue):
             break
         
         try:
-            temp_dir, out_path, fps, vcodec, pix_fmt = msg
+            temp_dir, out_path, fps, vcodec, pix_fmt, source_key = msg
             encode_video_frames(
                 video_path=out_path,
                 imgs_dir=temp_dir,
@@ -288,16 +313,38 @@ def video_encoder_service(video_queue: mp.JoinableQueue):
             )
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
+            _report_process_error(
+                error_queue,
+                "video_encoding",
+                e,
+                source_episode_key=source_key,
+                output_path=out_path,
+            )
             logging.error(f"Video Encoder Failed ({out_path}): {e}")
             traceback.print_exc()
         finally:
             video_queue.task_done()
 
-def worker_service(task_queue: mp.JoinableQueue, meta_req_queue: mp.Queue, resp_queue: mp.Queue, video_queue: mp.JoinableQueue, root: Path, features: Dict, fps: int, rank: int, codec: str = "h264", pix_fmt: str = "yuv420p", has_extras: bool = False):
+def worker_service(
+    task_queue: mp.JoinableQueue,
+    meta_req_queue: mp.Queue,
+    resp_queue: mp.Queue,
+    video_queue: mp.JoinableQueue,
+    error_queue: mp.Queue,
+    root: Path,
+    features: Dict,
+    fps: int,
+    rank: int,
+    codec: str = "h264",
+    pix_fmt: str = "yuv420p",
+    has_extras: bool = False,
+):
     """Entry point for Worker Processes."""
     meta_client = MetadataClient(meta_req_queue, resp_queue, rank)
     
     while True:
+        builder = None
+        source_key = None
         try:
             item = task_queue.get()
         except (EOFError, BrokenPipeError):
@@ -316,6 +363,7 @@ def worker_service(task_queue: mp.JoinableQueue, meta_req_queue: mp.Queue, resp_
                 iterator = item
                 if has_extras and hasattr(item, "metadata"):
                     extra_metadata = item.metadata
+                    source_key = extra_metadata.get("source_episode_key")
                 
             builder = WorkerEpisodeBuilder(root, meta_client, features, fps, video_queue, codec=codec, pix_fmt=pix_fmt, has_extras=has_extras, extra_metadata=extra_metadata)
             
@@ -338,6 +386,18 @@ def worker_service(task_queue: mp.JoinableQueue, meta_req_queue: mp.Queue, resp_
             builder.finalize()
             
         except Exception as e:
+            if builder is not None:
+                try:
+                    builder.image_writer.stop()
+                except Exception:
+                    pass
+            _report_process_error(
+                error_queue,
+                "episode_conversion",
+                e,
+                source_episode_key=source_key,
+                worker_rank=rank,
+            )
             logging.error(f"Worker Task Failed: {e}")
             traceback.print_exc()
         finally:
@@ -376,6 +436,9 @@ class LeRobotCreator:
         self.task_queue = mp.JoinableQueue(maxsize=num_workers * 2) 
         self.meta_req_queue = mp.Queue()
         self.video_queue = mp.JoinableQueue()
+        self.error_queue = mp.Queue()
+        self._waited = False
+        self._errors = []
         
         # Create dedicated reply queues for each worker
         # and the num_workers + 1 for creator if needed
@@ -386,7 +449,7 @@ class LeRobotCreator:
         # We pass the list of reply queues to metadata service
         self.meta_process = mp.Process(
             target=metadata_service, 
-            args=(self.root, self.meta_req_queue, self.reply_queues),
+            args=(self.root, self.meta_req_queue, self.reply_queues, self.error_queue),
             daemon=True
         )
         self.meta_process.start()
@@ -396,7 +459,7 @@ class LeRobotCreator:
         for _ in range(num_video_encoders):
             p = mp.Process(
                 target=video_encoder_service, 
-                args=(self.video_queue,),
+                args=(self.video_queue, self.error_queue),
                 daemon=True
             )
             p.start()
@@ -408,7 +471,7 @@ class LeRobotCreator:
             # Pass the SPECIFIC reply queue for this worker, and its rank
             p = mp.Process(
                 target=worker_service, 
-                args=(self.task_queue, self.meta_req_queue, self.reply_queues[i], self.video_queue, self.root, features, fps, i, codec, pix_fmt, has_extras),
+                args=(self.task_queue, self.meta_req_queue, self.reply_queues[i], self.video_queue, self.error_queue, self.root, features, fps, i, codec, pix_fmt, has_extras),
                 daemon=True
             )
             p.start()
@@ -431,6 +494,12 @@ class LeRobotCreator:
         """
         Waits for all submitted episodes to be processed and encoded, then shuts down.
         """
+        if self._waited:
+            if self._errors:
+                raise RuntimeError(self._format_errors())
+            return
+        self._waited = True
+
         # 1. Wait for all submitted tasks to be picked up and processed by workers
         self.task_queue.join()
         
@@ -455,3 +524,37 @@ class LeRobotCreator:
         # 5. Stop Metadata
         self.meta_req_queue.put((CMD_STOP, None, None))
         self.meta_process.join()
+
+        while True:
+            try:
+                self._errors.append(self.error_queue.get(timeout=0.1))
+            except Empty:
+                break
+        for stage, processes in (
+            ("worker_process", self.workers),
+            ("video_encoder_process", self.encoders),
+            ("metadata_process", [self.meta_process]),
+        ):
+            for process in processes:
+                if process.exitcode not in (0, None):
+                    self._errors.append(
+                        {"stage": stage, "error": f"process exited with code {process.exitcode}"}
+                    )
+        if self._errors:
+            raise RuntimeError(self._format_errors())
+
+    def _format_errors(self) -> str:
+        preview = "; ".join(
+            f"{item.get('stage')}: {item.get('source_episode_key') or '-'}: {item.get('error')}"
+            for item in self._errors[:5]
+        )
+        suffix = "" if len(self._errors) <= 5 else f"; ... {len(self._errors) - 5} more"
+        return f"LeRobotCreator failed with {len(self._errors)} child-process error(s): {preview}{suffix}"
+
+    @property
+    def errors(self) -> list[dict]:
+        return list(self._errors)
+
+    @property
+    def finished(self) -> bool:
+        return self._waited
