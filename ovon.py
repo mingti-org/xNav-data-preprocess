@@ -68,53 +68,65 @@ class EpisodeIterator:
             "object_category": episode["object_category"],
             "navigation_metrics": episode.get("metrics"),
         }
+        self.video_sources = {
+            output_key: str(source.root / f"{source_view}.mp4")
+            for source_view, output_key in VIEWS.items()
+        }
 
     def __iter__(self) -> Iterator[tuple[dict[str, Any], str]]:
         episode, steps = load_and_validate_episode(self.source, self.dataset_name)
         positions = np.asarray([step["position"] for step in steps], dtype=np.float64)
         rotations = np.asarray([step["rotation"] for step in steps], dtype=np.float64)
         states = habitat_poses_to_xnav(positions, rotations)
-        captures = {
-            VIEWS[view]: cv2.VideoCapture(str(self.source.root / f"{view}.mp4"))
-            for view in VIEWS
-        }
-        expected_width = int(episode["video_width"])
-        expected_height = int(episode["video_height"])
-        expected_fps = float(episode["video_fps"])
-        try:
-            for key, capture in captures.items():
-                if not capture.isOpened():
-                    raise ValueError(f"cannot open video: {key}")
-                width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                fps = float(capture.get(cv2.CAP_PROP_FPS))
-                if (width, height) != (expected_width, expected_height):
-                    raise ValueError(
-                        f"video dimensions mismatch for {key}: {width}x{height}, "
-                        f"expected {expected_width}x{expected_height}"
-                    )
-                if abs(fps - expected_fps) > 0.2:
-                    raise ValueError(
-                        f"video FPS mismatch for {key}: {fps}, expected {expected_fps}"
-                    )
-            for index, step in enumerate(steps):
-                frame: dict[str, Any] = {}
-                for key, capture in captures.items():
-                    ok, image = capture.read()
-                    if not ok:
-                        raise ValueError(f"video ended before frame {index}: {key}")
-                    if image.shape[:2] != (expected_height, expected_width):
-                        raise ValueError(f"unexpected video shape for {key}: {image.shape}")
-                    frame[key] = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                frame["observation.state"] = states[index]
-                frame["action"] = np.asarray(
+        _validate_source_videos(self.source, episode, len(steps))
+        for index, step in enumerate(steps):
+            yield {
+                "observation.state": states[index],
+                "action": np.asarray(
                     [step["discrete_action_to_next_id"]], dtype=np.int64
+                ),
+                "action_text": step["discrete_action_to_next"],
+            }, self.source.task
+
+
+def _validate_source_videos(
+    source: SourceEpisode, episode: dict[str, Any], expected_frames: int
+) -> None:
+    expected_width = int(episode["video_width"])
+    expected_height = int(episode["video_height"])
+    expected_fps = float(episode["video_fps"])
+    for source_view, output_key in VIEWS.items():
+        path = source.root / f"{source_view}.mp4"
+        capture = cv2.VideoCapture(str(path))
+        try:
+            if not capture.isOpened():
+                raise ValueError(f"cannot open video: {output_key}")
+            actual = (
+                int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                float(capture.get(cv2.CAP_PROP_FPS)),
+                int(capture.get(cv2.CAP_PROP_FRAME_COUNT)),
+            )
+            if actual[:2] != (expected_width, expected_height):
+                raise ValueError(
+                    f"video dimensions mismatch for {output_key}: "
+                    f"{actual[0]}x{actual[1]}, expected {expected_width}x{expected_height}"
                 )
-                frame["action_text"] = step["discrete_action_to_next"]
-                yield frame, self.source.task
+            if abs(actual[2] - expected_fps) > 0.2:
+                raise ValueError(
+                    f"video FPS mismatch for {output_key}: {actual[2]}, "
+                    f"expected {expected_fps}"
+                )
+            if actual[3] < expected_frames:
+                raise ValueError(
+                    f"video ended before frame {expected_frames}: "
+                    f"{output_key} has {actual[3]} frames"
+                )
+            ok, _ = capture.read()
+            if not ok:
+                raise ValueError(f"cannot decode video: {output_key}")
         finally:
-            for capture in captures.values():
-                capture.release()
+            capture.release()
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -477,7 +489,7 @@ def _validate_output(
                     int(round(capture.get(cv2.CAP_PROP_FPS))),
                     int(capture.get(cv2.CAP_PROP_FRAME_COUNT)),
                 )
-                if actual != (width, height, fps, source.length):
+                if actual[:3] != (width, height, fps) or actual[3] < source.length:
                     raise ValueError(
                         f"output video metadata mismatch for {video_path}: {actual}"
                     )
@@ -486,6 +498,12 @@ def _validate_output(
                     raise ValueError(f"cannot decode output video: {video_path}")
             finally:
                 capture.release()
+            source_view = next(
+                view for view, output_key in VIEWS.items() if output_key == video_key
+            )
+            source_video = source.root / f"{source_view}.mp4"
+            if video_path.stat().st_size != source_video.stat().st_size:
+                raise ValueError(f"output video size differs from source: {video_path}")
         total_frames += source.length
     if (
         int(info.get("total_episodes", -1)) != len(expected)
@@ -590,7 +608,7 @@ def convert(
         fps=fps,
         features=features,
         num_workers=workers,
-        num_video_encoders=min(workers, 16),
+        num_video_encoders=0,
         has_extras=True,
     )
     task_indices: dict[str, int] = {}
@@ -637,6 +655,7 @@ def convert(
             "dataset_name": dataset_name,
             "publishable": True,
             "coordinate_frame": "xnav_episode_start_relative",
+            "copy_mode": "copy2",
             "source_layouts": [source_split.partition for source_split in splits],
             "source_success_manifest_rows": len(sources),
             "source_recorded_errors": recorded_errors,

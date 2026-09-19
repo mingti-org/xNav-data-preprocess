@@ -76,7 +76,19 @@ class MetadataClient:
 
 class WorkerEpisodeBuilder:
     """Manages state for building a single episode within a Worker Process."""
-    def __init__(self, root: Path, meta_client: MetadataClient, features: Dict, fps: int, video_queue: mp.Queue, codec: str = "h264", pix_fmt: str = "yuv420p", has_extras: bool = False, extra_metadata: Dict = None):
+    def __init__(
+        self,
+        root: Path,
+        meta_client: MetadataClient,
+        features: Dict,
+        fps: int,
+        video_queue: mp.Queue,
+        codec: str = "h264",
+        pix_fmt: str = "yuv420p",
+        has_extras: bool = False,
+        extra_metadata: Dict = None,
+        video_sources: Dict[str, str] = None,
+    ):
         self.root = root
         self.meta = meta_client
         self.features = features
@@ -85,7 +97,7 @@ class WorkerEpisodeBuilder:
         self.codec = codec
         self.pix_fmt = pix_fmt
         self.has_extras = has_extras
-        self.extra_metadata = extra_metadata or {}
+        self.extra_metadata = dict(extra_metadata or {})
         
         # 1. Allocate Episode ID
         self.episode_index = self.meta.allocate_episode_index()
@@ -97,14 +109,26 @@ class WorkerEpisodeBuilder:
         self.buffer["task"] = [] 
         
         self.image_keys = [k for k, v in features.items() if v["dtype"] in ["image", "video"]]
-        self.image_buffer = {k: [] for k in self.image_keys} 
+        self.video_keys = [k for k, v in features.items() if v["dtype"] == "video"]
+        self.video_sources = {
+            key: Path(path) for key, path in (video_sources or {}).items()
+        }
+        if self.video_sources and set(self.video_sources) != set(self.video_keys):
+            raise ValueError(
+                "video_sources must provide every video feature exactly once: "
+                f"expected {sorted(self.video_keys)}, got {sorted(self.video_sources)}"
+            )
+        self.generated_image_keys = [
+            key for key in self.image_keys if key not in self.video_sources
+        ]
+        self.image_buffer = {k: [] for k in self.generated_image_keys}
 
         self.chunk_size = 1000
         self.chunk = self.episode_index // self.chunk_size
         
         # 3. Prepare Temp Directories
         self.temp_image_dirs = {}
-        for key in self.image_keys:
+        for key in self.generated_image_keys:
              # Use atomic mkdir or ignore exist error
              p = self.root / "videos" / f"chunk-{self.chunk:03d}" / key / f"episode_{self.episode_index:06d}_temp"
              try:
@@ -126,7 +150,7 @@ class WorkerEpisodeBuilder:
         self.buffer["task"].append(task)
         
         # Save Images
-        for key in self.image_keys:
+        for key in self.generated_image_keys:
             if key in frame:
                 img = process_image(frame[key])
                 img_path = self.temp_image_dirs[key] / f"frame_{self.frame_count:06d}.png"
@@ -183,7 +207,7 @@ class WorkerEpisodeBuilder:
             for key in self.features:
                 if key in data:
                     stats_buffer[key] = data[key]
-                elif key in self.image_keys:
+                elif key in self.image_buffer:
                     stats_buffer[key] = self.image_buffer[key]
             
             ep_stats = compute_episode_stats(stats_buffer, self.features)
@@ -193,7 +217,7 @@ class WorkerEpisodeBuilder:
             })
         
         # Submit Video Encoding Jobs
-        for key in self.image_keys:
+        for key in self.generated_image_keys:
             temp_dir = self.temp_image_dirs[key]
             out_dir = self.root / "videos" / f"chunk-{self.chunk:03d}" / key
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -209,6 +233,18 @@ class WorkerEpisodeBuilder:
                     self.extra_metadata.get("source_episode_key"),
                 )
             )
+
+        for key, source_path in self.video_sources.items():
+            if not source_path.is_file() or source_path.stat().st_size <= 0:
+                raise ValueError(f"missing or empty source video: {source_path}")
+            out_dir = self.root / "videos" / f"chunk-{self.chunk:03d}" / key
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"episode_{self.episode_index:06d}.mp4"
+            shutil.copy2(source_path, out_path)
+            if out_path.stat().st_size != source_path.stat().st_size:
+                raise OSError(
+                    f"copied video size mismatch: {source_path} -> {out_path}"
+                )
 
         # Update Meta
         self.meta.append_episode({
@@ -357,15 +393,28 @@ def worker_service(
         try:
             # Handle incoming task (create iterator)
             extra_metadata = {}
+            video_sources = None
             if callable(item):
                 iterator = item()
             else:
                 iterator = item
+                video_sources = getattr(item, "video_sources", None)
                 if has_extras and hasattr(item, "metadata"):
                     extra_metadata = item.metadata
                     source_key = extra_metadata.get("source_episode_key")
                 
-            builder = WorkerEpisodeBuilder(root, meta_client, features, fps, video_queue, codec=codec, pix_fmt=pix_fmt, has_extras=has_extras, extra_metadata=extra_metadata)
+            builder = WorkerEpisodeBuilder(
+                root,
+                meta_client,
+                features,
+                fps,
+                video_queue,
+                codec=codec,
+                pix_fmt=pix_fmt,
+                has_extras=has_extras,
+                extra_metadata=extra_metadata,
+                video_sources=video_sources,
+            )
             
             for element in iterator:
                 # Unpack tuple (frame, task) or dict

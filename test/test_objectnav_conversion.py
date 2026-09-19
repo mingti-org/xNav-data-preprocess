@@ -167,7 +167,7 @@ def test_episode_iterator_converts_habitat_pose_to_xnav(tmp_path: Path) -> None:
 
 
 def test_conversion_closes_parquet_video_and_provenance(tmp_path: Path) -> None:
-    source_root, _ = _create_source(
+    source_root, episode_dir = _create_source(
         tmp_path / "source", dataset_name="ovon", layout="shard"
     )
     output_root = tmp_path / "processed"
@@ -176,6 +176,7 @@ def test_conversion_closes_parquet_video_and_provenance(tmp_path: Path) -> None:
     report = json.loads((output_root / "conversion_report.json").read_text())
     assert report["publishable"] is True
     assert report["coordinate_frame"] == "xnav_episode_start_relative"
+    assert report["copy_mode"] == "copy2"
     assert report["source_layouts"] == ["shard_0"]
     extras = [
         json.loads(line)
@@ -187,8 +188,21 @@ def test_conversion_closes_parquet_video_and_provenance(tmp_path: Path) -> None:
     states = np.asarray(table["observation.state"].to_pylist())
     np.testing.assert_allclose(states[1, :3], [0.25, 0, 0], atol=1e-6)
     assert table["action_text"].to_pylist() == ["forward", "turn_left", "STOP"]
-    assert (output_root / "videos/chunk-000/video.rear/episode_000000.mp4").is_file()
+    output_videos = output_root / "videos/chunk-000"
+    for source_view, output_view in {
+        "front": "front",
+        "back": "rear",
+        "left": "left",
+        "right": "right",
+    }.items():
+        assert (
+            output_videos / f"video.{output_view}/episode_000000.mp4"
+        ).read_bytes() == (episode_dir / f"{source_view}.mp4").read_bytes()
     assert not (output_root / "videos/chunk-000/video.back").exists()
+    stats = json.loads(
+        (output_root / "meta/episodes_stats.jsonl").read_text().splitlines()[0]
+    )["stats"]
+    assert set(stats) == {"observation.state"}
 
 
 def test_worker_error_blocks_publication_and_is_reported(tmp_path: Path) -> None:
